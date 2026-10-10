@@ -188,7 +188,8 @@ class VerifierTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory(prefix="vortex verifier with spaces ")
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        # Windows temp paths may use 8.3 names; the verifier canonicalizes its root.
+        self.root = Path(temporary.name).resolve()
         (self.root / "tests/unit").mkdir(parents=True)
         (self.root / "tests/unit/test_sample.py").write_text('"""Synthetic fixture."""\n')
         (self.root / "scripts").mkdir()
@@ -197,10 +198,10 @@ class VerifierTests(unittest.TestCase):
         self.launch.return_value = subprocess.CompletedProcess([], 0, "", "Ran 1 test in 0.001s\n\nOK\n")
         self.enterContext(patch.dict(os.environ, {}, clear=True))
 
-    def invoke(self) -> tuple[int, str]:
+    def invoke(self, root: Path | None = None) -> tuple[int, str]:
         output, errors = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(errors):
-            code = verify.main(self.root)
+            code = verify.main(self.root if root is None else root)
         return code, output.getvalue() + errors.getvalue()
 
     def test_import_is_safe(self) -> None:
@@ -216,6 +217,15 @@ class VerifierTests(unittest.TestCase):
                 self.launch.return_value.returncode = code
                 self.assertEqual(self.invoke()[0], 1)
                 self.assertEqual(self.launch.call_count, 1)
+
+    def test_empty_suite_exit_five_is_operational_failure(self) -> None:
+        (self.root / ".git").mkdir()
+        self.launch.return_value = subprocess.CompletedProcess(
+            [], 5, "", "Ran 0 tests in 0.000s\n\nNO TESTS RAN\n")
+        code, output = self.invoke()
+        self.assertEqual(code, 2)
+        self.assertIn("ERROR", output)
+        self.assertEqual(self.launch.call_count, 1)
 
     def test_success_uses_current_python_safe_arguments_and_index_scan(self) -> None:
         (self.root / ".git").mkdir()
@@ -241,6 +251,16 @@ class VerifierTests(unittest.TestCase):
             self.assertFalse(call.kwargs.get("shell", False))
         self.assertEqual(dict(os.environ), before)
         self.assertIn("PASS", output)
+
+    def test_root_with_parent_segments_keeps_scan_in_checkout(self) -> None:
+        (self.root / ".git").mkdir()
+        code, output = self.invoke(self.root / "scripts" / "..")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(self.launch.call_args_list), 2)
+        for call in self.launch.call_args_list:
+            self.assertEqual(call.kwargs["cwd"], self.root)
+        scan = self.launch.call_args_list[1].args[0]
+        self.assertEqual(Path(scan[-2]), self.root / "scripts/publication.py")
 
     def test_git_file_and_override_cannot_skip_scan(self) -> None:
         (self.root / ".git").write_text("gitdir: synthetic location\n")

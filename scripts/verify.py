@@ -43,12 +43,12 @@ def main(root: Path | None = None) -> int:
                         "-p", "test_*.py", "-v"], root, "CPU unit tests")
     if result is None:
         return 2
-    if result.returncode:
+    if result.returncode not in (0, 5):
         print(f"FAIL: CPU unit tests (child exit {result.returncode}).", file=sys.stderr)
         return 1
-    # unittest exits successfully for an empty suite; that is not verification evidence.
+    # Empty discovery is not evidence: older unittest returns 0, Python 3.14+ returns 5.
     counts = re.findall(r"^Ran ([0-9]+) tests? in ", result.stderr, re.MULTILINE)
-    if not counts or int(counts[-1]) == 0:
+    if result.returncode == 5 or not counts or int(counts[-1]) == 0:
         print("ERROR: no tests confirmed by unittest discovery; inspect tests/unit and its output.",
               file=sys.stderr)
         return 2
