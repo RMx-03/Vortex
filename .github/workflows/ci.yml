@@ -1,0 +1,97 @@
+name: CPU checks
+"on":
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    # Branch deletion publishes no new content and has no checkout to verify.
+    if: github.event_name != 'push' || github.event.deleted == false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.11', '3.14']
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          lfs: false
+          submodules: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: New commit publication history
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          try:
+              event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text(encoding='utf-8'))
+              kind = os.environ['GITHUB_EVENT_NAME']
+              expected = os.environ['GITHUB_SHA']
+              if kind == 'pull_request':
+                  base = event['pull_request']['base']['sha']
+                  head = event['pull_request']['head']['sha']
+                  # A logical range, not a push: omit the synthetic merge message.
+                  destination = 'refs/heads/main'
+              elif kind == 'push':
+                  base, head, destination = event['before'], event['after'], event['ref']
+              else:
+                  raise ValueError('Unsupported event')
+              if any(not isinstance(oid, str) or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', oid)
+                     for oid in (base, head, expected)):
+                  raise ValueError('Invalid event object IDs')
+              if len(base) != len(head) or len(head) != len(expected) or set(head) == {'0'}:
+                  raise ValueError('Inconsistent event object IDs')
+              if kind == 'pull_request' and set(base) == {'0'}:
+                  raise ValueError('Missing PR base')
+              if not isinstance(destination, str) or not destination.startswith('refs/heads/') or any(
+                      character.isspace() for character in destination):
+                  raise ValueError('Invalid branch destination')
+              checkout = subprocess.check_output(
+                  ['git', '--no-replace-objects', 'rev-parse', '--verify', 'HEAD^{commit}'],
+                  text=True, stderr=subprocess.PIPE).strip()
+              if checkout != expected or (kind == 'push' and head != expected):
+                  raise ValueError('Unexpected checkout')
+          except (OSError, KeyError, TypeError, ValueError, subprocess.CalledProcessError):
+              print('CI history check could not establish the event/checkout; verify event data and full Git history.',
+                    file=sys.stderr)
+              raise SystemExit(2)
+
+          # The scanner checks metadata and every new tree, including later-deleted files.
+          update = f'HEAD {head} {destination} {base}\n'
+          result = subprocess.run([sys.executable, '-B', 'scripts/publication.py', 'outgoing'],
+                                  input=update, text=True, check=False)
+          raise SystemExit(result.returncode)
+      - name: Public checkout tree
+        shell: python
+        run: |
+          import subprocess
+          import sys
+          raise SystemExit(subprocess.call([sys.executable, '-B', 'scripts/publication.py', 'tree', 'HEAD']))
+      - name: Public CPU tests and index scan
+        shell: python
+        run: |
+          import subprocess
+          import sys
+          raise SystemExit(subprocess.call([sys.executable, '-B', 'scripts/verify.py']))
