@@ -6,7 +6,7 @@ Vortex is an experimental, single-GPU LLM inference runtime designed to explore 
 
 The project aims to expose and implement the systems mechanisms that normally remain hidden behind high-level inference APIs. Its intended use case is several clients sharing one GPU, with irregular prompt lengths, generation lengths, and arrival times.
 
-**Status: Initial development / project setup.** Inference-runtime components are not yet implemented. The development roadmap and system design have been established; Phase 0 has not started. Capabilities and architecture described below are planned, and no performance results are available yet.
+**Status: Development scaffold in place; inference runtime not implemented.** The package skeleton, development tools and documentation are available in this repository. Phase 0 has not started. Capabilities and architecture described below remain planned, and no model execution, GPU benchmark or runtime performance result has been verified.
 
 Using an existing inference engine provides a ready-made serving abstraction. Developing Vortex means owning the decisions inside that abstraction: which requests run, how batches change, where cached attention state lives, how resources are reclaimed, and how behavior is measured. PyTorch and Hugging Face Transformers are the intended model-execution foundations; Vortex will develop its own runtime control mechanisms.
 
@@ -89,7 +89,7 @@ The initial implementation targets **one GPU**. This list describes the intended
 | Benchmark analysis | JSONL/CSV artifacts, pandas, and matplotlib |
 | Continuous integration | GitHub Actions for CPU checks and publication checks |
 
-Exact model revisions, dependency versions, and execution settings will be pinned for reproducible experiments. The starter's offline setup checks use Python's standard-library test runner.
+Exact model revisions, dependency versions, and execution settings will be pinned for reproducible experiments. The scaffold's offline CPU checks use Python's standard-library test runner.
 
 ## Development roadmap
 
@@ -123,15 +123,15 @@ No benchmark numbers, speedup claims, or supported-capacity claims have been est
 
 Vortex is intended for experimentation on accessible hardware with small open-weight models. The control plane will be CPU-testable, reserving GPU sessions for model execution, physical cache behavior, and performance measurements.
 
-Optional free GPU notebook environments such as Google Colab and Kaggle can provide experiment environments when available. Access and hardware are not guaranteed. Experiments should preserve their inputs, environment metadata, and results outside ephemeral notebook state. No GPU service or model download is required for the starter's CPU setup checks.
+Optional free GPU notebook environments such as Google Colab and Kaggle can provide experiment environments when available. Access and hardware are not guaranteed. Experiments should preserve their inputs, environment metadata, and results outside ephemeral notebook state. No GPU service or model download is required for the scaffold's CPU checks.
 
 ## Project status
 
-**Status: Initial development / project setup.**
+**Status: Development scaffold in place; inference runtime not implemented.**
 
-The system design and Phase 0–8 roadmap are established. Inference-runtime components are not yet implemented, Phase 0 has not started, and runtime correctness and GPU performance remain unverified.
+The repository includes a `src/vortex/` Python package skeleton, publication security checks, CPU unit tests, GitHub Actions CI, architecture and benchmark-methodology documentation, and Colab/Kaggle GPU environment-probe notebooks. The private development knowledge base remains a separate local workspace and is not distributed through GitHub.
 
-The initial repository commit contains this README only. The local starter workspace is installed separately; its scaffolding, setup utilities, documentation, and CPU checks are not part of that initial publication.
+The system design and Phase 0–8 roadmap are established. Package modules are placeholders, inference-runtime components are not yet implemented, and Phase 0 has not started. Model execution, GPU benchmarks, runtime correctness and runtime performance remain unverified.
 
 ## Project scope and non-goals
 
@@ -141,17 +141,17 @@ The initial scope is a small, inspectable single-GPU runtime with explicit sched
 
 ## Getting started
 
-There is no runnable inference server yet. The initial GitHub publication is documentation only.
+There is no runnable inference server yet. The development scaffold and its verification utilities are included in this repository.
 
-After the starter is installed locally, consult [reproducibility and setup notes](docs/reproducibility.md), [contribution conventions](CONTRIBUTING.md), and [code-quality guidance](CODE_QUALITY.md). These files are provided by the local starter and will resolve in a public checkout only after a subsequent publication includes them.
+Consult [reproducibility and setup notes](docs/reproducibility.md), [contribution conventions](CONTRIBUTING.md), and [code-quality guidance](CODE_QUALITY.md) for the available scaffold and development workflow.
 
-The installed starter provides an offline, CPU-only verification command from the repository root:
+From the repository root, use Python 3.11+ and Git to run the offline, CPU-only verification command. Package installation, PyTorch, CUDA and model weights are not required:
 
 ```sh
 python scripts/verify.py
 ```
 
-This validates starter utilities and publication checks; it does not run model inference or establish runtime correctness. Model-loading, server-startup, and benchmark commands will be documented when those capabilities exist.
+This runs the CPU unit tests and, in a Git checkout, the publication check of the full effective Git index. The publication check does not inspect unstaged or untracked files or outgoing history. These checks do not run model inference or establish runtime correctness. Model-loading, server-startup, and benchmark commands will be documented when those capabilities exist.
 
 ## License
 
