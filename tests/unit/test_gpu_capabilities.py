@@ -151,37 +151,271 @@ class GPUProbeTests(unittest.TestCase):
         self.assertIsNone(report["device_count"])
         self.assertEqual(report["devices"], [])
 
-    def test_cli_missing_torch_success_and_probe_error_exit(self) -> None:
-        for missing, expected in ((True, 0), (False, 2)):
-            with self.subTest(missing=missing):
-                self.finder.return_value = None if missing else object()
-                self.importer.side_effect = ImportError("synthetic-detail-do-not-print")
-                output = io.StringIO()
-                with redirect_stdout(output):
-                    code = gpu.main()
-                self.assertEqual(code, expected)
-                self.assertNotIn("synthetic-detail-do-not-print", output.getvalue())
-                self.assertIn(json.loads(output.getvalue())["status"], ("torch_unavailable", "probe_error"))
-
-    def test_cli_dependency_noise_is_suppressed_and_streams_restored(self) -> None:
-        def noisy_import(name: str) -> SimpleNamespace:
-            print("synthetic dependency chatter")
-            print("synthetic dependency warning", file=sys.stderr)
-            return fake_torch()
-
-        self.importer.side_effect = noisy_import
-        output, errors = io.StringIO(), io.StringIO()
-        with redirect_stdout(output), redirect_stderr(errors):
-            self.assertEqual(gpu.main(), 0)
-            self.assertIs(sys.stdout, output)
-            self.assertIs(sys.stderr, errors)
-        self.assertEqual(json.loads(output.getvalue())["status"], "cuda_unavailable")
-        self.assertEqual(errors.getvalue(), "")
-
     def test_keyboard_interrupt_is_not_swallowed(self) -> None:
         self.importer.side_effect = KeyboardInterrupt
         with self.assertRaises(KeyboardInterrupt):
             gpu.capability()
+
+
+class NativeOutputRegressionTests(unittest.TestCase):
+    def test_parent_import_noise_cannot_contaminate_cli_json(self) -> None:
+        # Removing process isolation lets these native writes bypass Python streams.
+        code = '''import importlib.util, os, sys, types
+spec = importlib.util.spec_from_file_location("probe", sys.argv[1])
+gpu = importlib.util.module_from_spec(spec); spec.loader.exec_module(gpu)
+def noisy(name):
+    os.write(1, b"SYNTHETIC_NATIVE_STDOUT\\n")
+    os.write(2, b"SYNTHETIC_NATIVE_STDERR\\n")
+    return types.SimpleNamespace(__version__="synthetic", version=types.SimpleNamespace(cuda=None),
+                                cuda=types.SimpleNamespace(is_available=lambda: False))
+gpu.importlib.util.find_spec = lambda name: object()
+gpu.importlib.import_module = noisy
+raise SystemExit(gpu.main())
+'''
+        result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", code,
+                                 str(ROOT / "scripts/gpu_capabilities.py")],
+                                capture_output=True, text=True, encoding="utf-8", timeout=20)
+        self.assertEqual(result.stderr, "", "Native diagnostics escaped the CLI boundary")
+        report = json.loads(result.stdout)
+        self.assertIn(report["status"], {"torch_unavailable", "cuda_unavailable", "probe_error"})
+        self.assertIn(result.returncode, (0, 2))
+
+class IsolatedCLITests(unittest.TestCase):
+    def invoke(self, body: str = "", timeout: float | None = None,
+               os_streams: bool = False) -> tuple[int, dict]:
+        # Exercise the real launcher, worker and result transport; only torch is synthetic.
+        with tempfile.TemporaryDirectory(prefix="vortex synthetic worker with spaces ") as directory:
+            driver = Path(directory) / "probe driver.py"
+            driver.write_text(
+                "import importlib.util,os,sys,time,types\n"
+                f"spec=importlib.util.spec_from_file_location('real_probe',{str(ROOT/'scripts/gpu_capabilities.py')!r})\n"
+                "real=importlib.util.module_from_spec(spec);spec.loader.exec_module(real)\n"
+                "props=lambda i:types.SimpleNamespace(name='Synthetic '+str(i),total_memory=(i+1)*1024**3,major=8,minor=6)\n"
+                "cuda=types.SimpleNamespace(is_available=lambda:True,device_count=lambda:2,get_device_properties=props)\n"
+                "torch=types.SimpleNamespace(__version__='synthetic-worker',version=types.SimpleNamespace(cuda='12.1'),cuda=cuda)\n"
+                "real.importlib.util.find_spec=lambda name:object()\n"
+                "real.importlib.import_module=lambda name:torch\n"
+                "real.shutil.which=lambda name:None\n"
+                "_worker=real._worker\n" + body + "\n", encoding="utf-8")
+            output, errors = io.StringIO(), io.StringIO()
+            launch = subprocess.run
+            paths = []
+            def record(args, **kwargs):
+                paths.append(Path(args[-2]))
+                return launch(args, **kwargs)
+            duration = gpu.PROBE_TIMEOUT_SECONDS if timeout is None else timeout
+            before = dict(os.environ)
+            if os_streams:
+                # An outer OS process catches leaks that StringIO cannot intercept.
+                code = ("import importlib.util,sys; "
+                        "s=importlib.util.spec_from_file_location('probe',sys.argv[1]); "
+                        "p=importlib.util.module_from_spec(s);s.loader.exec_module(p); "
+                        "p.__file__=sys.argv[2];raise SystemExit(p.main())")
+                result = launch([sys.executable, "-I", "-S", "-B", "-c", code,
+                                 str(ROOT / "scripts/gpu_capabilities.py"), str(driver)],
+                                capture_output=True, text=True, encoding="utf-8", timeout=20)
+                self.assertEqual(result.stderr, "")
+                self.assertNotIn("SYNTHETIC_PRIVATE", result.stdout)
+                return result.returncode, json.loads(result.stdout)
+            with patch.object(gpu, "__file__", str(driver)), \
+                    patch.object(gpu.subprocess, "run", side_effect=record), \
+                    patch.object(gpu, "PROBE_TIMEOUT_SECONDS", duration), \
+                    redirect_stdout(output), redirect_stderr(errors):
+                code = gpu.main()
+            self.assertEqual(errors.getvalue(), "")
+            self.assertNotIn("SYNTHETIC_PRIVATE", output.getvalue())
+            self.assertEqual(dict(os.environ), before)
+            self.assertTrue(paths and all(not p.parent.exists() for p in paths), "IPC directory leaked")
+            report = json.loads(output.getvalue(), parse_constant=lambda _: self.fail("Nonfinite JSON"))
+            return code, report
+
+    def test_worker_native_stdout_is_discarded_with_valid_metadata(self) -> None:
+        code, report = self.invoke("os.write(1,b'SYNTHETIC_PRIVATE_STDOUT\\n')")
+        self.assertEqual(code, 0)
+        self.assertEqual(report["torch_version"], "synthetic-worker")
+        self.assertEqual(report["status"], "cuda_available")
+        self.assertEqual(report["device_count"], 2)
+
+    def test_worker_native_stderr_is_discarded_with_valid_metadata(self) -> None:
+        code, report = self.invoke("os.write(2,b'SYNTHETIC_PRIVATE_STDERR\\n')")
+        self.assertEqual(code, 0)
+        self.assertEqual(report["devices"][1]["total_bytes"], 2*1024**3)
+
+    def test_complete_os_streams_are_clean_under_worker_noise(self) -> None:
+        code, report = self.invoke(
+            "os.write(1,b'SYNTHETIC_PRIVATE_STDOUT');os.write(2,b'SYNTHETIC_PRIVATE_STDERR')",
+            os_streams=True)
+        self.assertEqual((code, report["status"], report["torch_version"]),
+                         (0, "cuda_available", "synthetic-worker"))
+
+    @unittest.skipUnless(os.name == "nt", "Win32 standard-handle regression")
+    def test_windows_native_standard_handles_are_isolated(self) -> None:
+        body = """import ctypes
+kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+kernel.GetStdHandle.argtypes=[ctypes.c_ulong];kernel.GetStdHandle.restype=ctypes.c_void_p
+kernel.WriteFile.argtypes=[ctypes.c_void_p,ctypes.c_void_p,ctypes.c_ulong,ctypes.POINTER(ctypes.c_ulong),ctypes.c_void_p]
+for stream in (-11,-12):
+    message=ctypes.create_string_buffer(b'SYNTHETIC_PRIVATE_WIN32')
+    written=ctypes.c_ulong()
+    if not kernel.WriteFile(kernel.GetStdHandle(stream & 0xffffffff),message,len(message)-1,ctypes.byref(written),None):
+        raise OSError('Synthetic Win32 write failed')
+"""
+        code, report = self.invoke(body, os_streams=True)
+        self.assertEqual((code, report["torch_version"]), (0, "synthetic-worker"))
+
+    def test_worker_diagnostic_flood_does_not_buffer_or_deadlock(self) -> None:
+        code, report = self.invoke(
+            "for i in range(128):\n    os.write(1,b'x'*65536);os.write(2,b'y'*65536)")
+        self.assertEqual(code, 0)
+        self.assertEqual(report["status"], "cuda_available")
+
+    def test_missing_torch_remains_distinct_from_cpu_cuda(self) -> None:
+        for body, wanted in [
+                ("real.importlib.util.find_spec=lambda name:None", "torch_unavailable"),
+                ("cuda.is_available=lambda:False;torch.version.cuda=None", "cuda_unavailable")]:
+            with self.subTest(status=wanted):
+                code, report = self.invoke(body)
+                self.assertEqual((code, report["status"]), (0, wanted))
+                self.assertEqual(report["device_count"], None if wanted=="torch_unavailable" else 0)
+
+    def test_worker_errors_are_sanitized_and_partial_facts_retained(self) -> None:
+        code, report = self.invoke(
+            "def fail(name): raise OSError('SYNTHETIC_PRIVATE/path')\nreal.importlib.import_module=fail")
+        self.assertEqual(code, 2)
+        self.assertEqual(report["probe_error"], {"stage":"torch_import","type":"OSError"})
+        self.assertTrue(report["torch_installed"])
+        code, report = self.invoke(
+            "def fail(i): raise RuntimeError('SYNTHETIC_PRIVATE/path')\ncuda.get_device_properties=fail")
+        self.assertEqual(code, 2)
+        self.assertTrue(report["cuda_available"])
+        self.assertIsNone(report["device_count"])
+        self.assertEqual(report["devices"], [])
+
+    def test_failed_worker_cannot_claim_success_from_valid_file(self) -> None:
+        code, report = self.invoke(
+            "def _worker(path):\n    real._worker(path);return 9")
+        self.assertEqual(code, 2)
+        self.assertEqual(report["probe_error"], {"stage":"probe_process","type":"ProcessError"})
+        self.assertIsNone(report["cuda_available"])
+
+    def test_worker_crash_without_result_is_sanitized(self) -> None:
+        code, report = self.invoke("os.write(2,b'SYNTHETIC_PRIVATE_CRASH');os._exit(3)")
+        self.assertEqual(code, 2)
+        self.assertEqual(report["status"], "probe_error")
+
+    def test_malformed_oversized_and_nonfinite_results_fail_closed(self) -> None:
+        payloads = [b"{bad", b'{"status":"cuda_available","status":"torch_unavailable"}',
+                    b'{"status":NaN}', b"x"*(gpu.MAX_RESULT_BYTES+1)]
+        for payload in payloads:
+            with self.subTest(bytes=len(payload)):
+                code, report = self.invoke(
+                    f"def _worker(path):\n    open(path,'xb').write({payload!r});return 0")
+                self.assertEqual(code, 2)
+                self.assertEqual(report["status"], "probe_error")
+                self.assertIsNone(report["cuda_available"])
+
+    def test_zero_exit_missing_result_is_not_success(self) -> None:
+        code, report = self.invoke("def _worker(path): return 0")
+        self.assertEqual(code, 2)
+        self.assertEqual(report["probe_error"]["stage"], "probe_result")
+
+    def test_inconsistent_cuda_payload_is_not_trusted(self) -> None:
+        code, report = self.invoke(
+            "def _worker(path):\n"
+            "    report=real.capability();report['device_count']=3\n"
+            "    open(path,'xb').write(real.json.dumps(report).encode());return 0")
+        self.assertEqual(code, 2)
+        self.assertEqual(report["probe_error"]["type"], "InvalidResult")
+
+    def test_metadata_size_limits_fail_without_truncation(self) -> None:
+        for body in ("torch.__version__='x'*(real.MAX_TEXT_LENGTH+1)",
+                     "cuda.device_count=lambda:real.MAX_DEVICES+1",
+                     "cuda.get_device_properties=lambda i:types.SimpleNamespace(name='GPU',total_memory=2**1000,major=8,minor=0)"):
+            with self.subTest(body=body):
+                code, report = self.invoke(body)
+                self.assertEqual(code, 2)
+                self.assertEqual(report["status"], "probe_error")
+
+    def test_serialized_result_limit_does_not_publish_truncated_inventory(self) -> None:
+        code, report = self.invoke(
+            "cuda.device_count=lambda:64\n"
+            "cuda.get_device_properties=lambda i:types.SimpleNamespace(name='é'*512,total_memory=1024,major=8,minor=0)")
+        self.assertEqual(code, 2)
+        self.assertEqual(report["probe_error"], {"stage":"probe_result","type":"OutputLimit"})
+        self.assertIsNone(report["cuda_available"])
+        self.assertEqual(report["devices"], [])
+
+    def test_filesystem_package_visibility_reaches_worker(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vortex synthetic torch search path ") as directory:
+            module = Path(directory) / "torch.py"
+            module.write_text(
+                "import types\n__version__='synthetic-path-visible'\n"
+                "version=types.SimpleNamespace(cuda=None)\n"
+                "cuda=types.SimpleNamespace(is_available=lambda:False)\n", encoding="utf-8")
+            output, errors = io.StringIO(), io.StringIO()
+            with patch.object(sys, "path", [directory, *sys.path]), \
+                    redirect_stdout(output), redirect_stderr(errors):
+                self.assertEqual(gpu.main(), 0)
+            self.assertEqual(errors.getvalue(), "")
+            report = json.loads(output.getvalue())
+            self.assertEqual((report["status"], report["torch_version"]),
+                             ("cuda_unavailable", "synthetic-path-visible"))
+
+    def test_cleanup_failure_is_sanitized(self) -> None:
+        temporary = tempfile.TemporaryDirectory
+        class CleanupFailure:
+            def __init__(self, **kwargs):
+                self.directory = temporary(**kwargs)
+            def __enter__(self):
+                return self.directory.__enter__()
+            def __exit__(self, *args):
+                self.directory.__exit__(*args)
+                raise OSError("SYNTHETIC_PRIVATE/cleanup")
+        def worker(args, **kwargs):
+            Path(args[-2]).write_text("{}", encoding="utf-8")
+            return subprocess.CompletedProcess(args, 0)
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(gpu.tempfile, "TemporaryDirectory", CleanupFailure), \
+                patch.object(gpu.subprocess, "run", side_effect=worker), \
+                redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(gpu.main(), 2)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertNotIn("SYNTHETIC_PRIVATE", output.getvalue())
+        self.assertEqual(json.loads(output.getvalue())["probe_error"]["type"], "OSError")
+
+    def test_timeout_kills_reaps_worker_and_removes_ipc(self) -> None:
+        processes = []
+        popen = subprocess.Popen
+        def record(*args, **kwargs):
+            process = popen(*args, **kwargs);processes.append(process);return process
+        with patch.object(gpu.subprocess, "Popen", side_effect=record):
+            code, report = self.invoke("time.sleep(20)", timeout=0.4)
+        self.assertEqual(code, 2)
+        self.assertEqual(report["probe_error"], {"stage":"probe_process","type":"TimeoutExpired"})
+        self.assertTrue(processes and all(p.poll() is not None for p in processes))
+
+    def test_launch_and_temp_directory_errors_emit_json_only(self) -> None:
+        for target in ("subprocess.run", "tempfile.TemporaryDirectory"):
+            output, errors = io.StringIO(), io.StringIO()
+            with patch(target, side_effect=OSError("SYNTHETIC_PRIVATE/path")), \
+                    redirect_stdout(output), redirect_stderr(errors):
+                self.assertEqual(gpu.main(), 2)
+            self.assertEqual(errors.getvalue(), "")
+            self.assertNotIn("SYNTHETIC_PRIVATE", output.getvalue())
+            self.assertEqual(json.loads(output.getvalue())["probe_error"]["type"], "OSError")
+
+    def test_looping_import_path_resolution_is_sanitized(self) -> None:
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(gpu.Path, "resolve", side_effect=RuntimeError("SYNTHETIC_PRIVATE/loop")), \
+                redirect_stdout(output), redirect_stderr(errors):
+            try:
+                code = gpu.main()
+            except RuntimeError:
+                self.fail("Path-resolution error escaped instead of a sanitized JSON report")
+        self.assertEqual(code, 2)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertNotIn("SYNTHETIC_PRIVATE", output.getvalue())
+        self.assertEqual(json.loads(output.getvalue())["status"], "probe_error")
 
 
 class VerifierTests(unittest.TestCase):
