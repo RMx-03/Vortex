@@ -1,4 +1,4 @@
-# Reference configuration and manifest contract
+# Reference configuration, loading and manifest contract
 
 The reference configuration and schema validators run offline with Python's
 standard library. They do not load a model, import inference libraries, probe
@@ -21,9 +21,10 @@ are rejected.
 | `windows-cpu` | `cpu` | `float32` | eager |
 | `t4-fp16` | `cuda:0` | `float16` | eager |
 
-These are intended profiles, not support claims. Exact environment resolution,
-dependency compatibility, driver support and actual FP16 execution remain
-NOT VERIFIED. No automatic device, dtype or backend selection is permitted.
+These are intended profiles, not execution support claims. The
+[environment contract](reference-environment.md) records complete dependency locks
+and verified Windows imports. Actual model loading, driver support and FP16
+execution remain NOT VERIFIED. No automatic device, dtype or backend selection is permitted.
 BF16 and other devices require separately reviewed profiles.
 
 The prompt limit counts tokens **after** chat templating. Integer limits are
@@ -32,7 +33,7 @@ The default output cap is 32; EOS can finish earlier. Reject oversized prompts
 instead of truncating them. Booleans and floating point values are not integer
 token counts. This reference uses integer seed zero.
 
-The future initial workload consists of these three independent user messages,
+The initial workload consists of these three independent user messages,
 each with a nominal 32-token output cap:
 
 - `Reply with the single word vortex.`
@@ -43,8 +44,166 @@ There is no system message or thinking suffix. `tokenize=True`,
 `add_generation_prompt=True` and `enable_thinking=False` are required. The
 template's empty thinking block belongs to the input identity. Eager attention,
 no autocast/quantization/compilation, and a fresh model-owned `DynamicCache` per
-request are the intended execution contract; actual enforcement in a loader or
-generation call requires the later implementation.
+request are the intended execution contract. The loader enforces explicit eager
+loading; generation settings and per-request cache ownership belong to the later
+generation implementation.
+
+## Loading and prompt preparation
+
+`vortex.executor.reference_loading` imports without Torch, Transformers, Hub,
+network access or model assets. Its public operations are:
+
+```python
+load_reference(config: ReferenceConfig, *, offline: bool = False) -> LoadedReference
+prepare_prompt(loaded: LoadedReference, messages: Sequence[Mapping[str, str]],
+               config: ReferenceConfig) -> PreparedPrompt
+```
+
+These signatures describe the contract; invoking loading is a separate execution
+action. Local development uses synthetic assets and factories. Real pretrained
+loading requires a separately authorized host and the matching installed profile.
+Do not run a pretrained model on the local development laptop. No actual loading,
+weight acquisition or forward execution was performed to validate this adapter.
+
+The loader validates the immutable configuration and boolean offline flag before
+I/O. It reuses the existing environment verifier in a bounded isolated process
+with the current interpreter, requiring the complete installed profile, receipts,
+imports and API checks. The reviewed source checkout and its environment utility
+must be present; an installed namespace-only package is insufficient. This
+preflight is an import check, not full execution qualification. Before importing
+native packages in the calling process, the loader also binds every locked
+distribution's import roots to this interpreter's site-packages and rejects
+shadowed or preimported foreign roots. This covers ordinary import-path drift,
+not arbitrary malicious monkeypatching inside an already compromised process.
+
+The asset boundary is a dedicated private Hub cache outside the public checkout,
+selected through normal `HF_HOME`/`HF_HUB_CACHE` configuration before dependency
+imports. The cache must be operator-controlled and non-shared. Do not reuse a
+snapshot containing arbitrary files from a broad download. The only accepted
+snapshot entries are:
+
+- `config.json`
+- `generation_config.json`
+- `tokenizer_config.json`
+- `tokenizer.json`
+- `vocab.json`
+- `merges.txt`
+- `model.safetensors`
+
+Each fixed-file request supplies the exact repository/revision, `token=False`, an
+ETag timeout and `local_files_only=offline`. There is no online retry after an
+offline miss and no `local_dir`, arbitrary filename, source-code discovery, shard
+index or alternate-format fallback. Existing cache-directory symlinks/reparse
+points and returned-path escapes are rejected. Normal snapshot-to-blob symlinks
+are accepted only inside the same reviewed model cache. Unexpected sidecars,
+including `chat_template.jinja`, custom code, pickle or shard indexes, fail closed.
+Pre-download checks also cover the model's lock, incomplete-blob and negative-cache
+write areas. Directory enumeration is bounded; shared or cluttered caches should
+use a new dedicated location, without deleting existing operator data.
+
+Before any HF configuration/tokenizer/model parser reads an asset, the loader
+checks its exact size and immutable identity from the
+[pinned repository tree](https://huggingface.co/Qwen/Qwen3-0.6B/tree/c1899de289a04d12100db370d81485cdf75e47ca).
+The three JSON SHA256 values and decoded template SHA256 match the schema-1
+manifest contract. LFS SHA256 identifies the full `tokenizer.json` and
+`model.safetensors` bodies, never their pointer files. Vocab and merges use the
+reviewed Git blob SHA1, including its size/header; their computed body SHA256
+values are recorded as evidence. A hash binds content, not general file safety.
+
+`tokenizer_assets_sha256` is the canonical digest of a filename-to-body-SHA256
+object for `tokenizer_config.json`, `tokenizer.json`, `vocab.json` and `merges.txt`.
+`weights_sha256` is the canonical digest of
+`{"model.safetensors": <verified body SHA256>}`. `LoadedReference.assets`
+supplies these plus the four schema-known hashes. Configuration and asset identity
+are preserved separately from future run/source provenance; no complete run
+manifest or golden output is manufactured by loading.
+
+After byte validation, raw metadata rejects private attention/backend hooks,
+remote mappings and quantization/adapter/custom-generation entry points. Native
+Qwen3 dimensions, architecture and the saved dual EOS policy must match the
+reference. Native `Qwen3Config` and `GenerationConfig` objects are passed explicitly
+to loading. The saved generation config is evidence only; this adapter never
+executes it or adopts it as the future greedy generation policy.
+
+Tokenizer/model factories receive the audited local snapshot, pinned revision,
+`trust_remote_code=False` and `local_files_only=True`. The tokenizer must be fast,
+have the reviewed template and resolve the expected control IDs. The model uses
+`use_safetensors=True`, explicit `torch_dtype` and `attn_implementation="eager"`,
+is constructed in a CPU device/inference-mode context, moved explicitly to the
+requested device/dtype and put in `eval()`. Actual parameter devices/dtypes,
+configuration and eager selection are checked; no automatic device map, offload,
+autocast, quantization or alternate backend is accepted.
+
+Loading's inference mode is scoped. Future separately implemented execution must
+enter `loaded.inference_context()` again; returning a model does not disable
+autograd globally. The caller owns returned model/tokenizer objects and mutable
+input tensors. Failure drops partial local references without retaining raw
+dependency exceptions; caches are retained and never deleted. Allocator-reserved
+memory release is not guaranteed. Native construction/transfer is synchronous,
+without a hard wall-time or memory bound; there is no adapter retry loop.
+
+Prompt preparation accepts one nonempty user message, including each of the
+three fixtures. It snapshots the input, bounds text to 16,384 codepoints/64 KiB,
+and rendered text to 64 KiB before processing tensors. It uses the pinned chat
+template with `add_generation_prompt=True`, `enable_thinking=False`,
+`tokenize=True`, `return_tensors="pt"`, `return_dict=True`, `padding=False`,
+`truncation=False` and an explicit attention mask. The empty thinking block stays
+in the input identity. Thinking mode changes input tokens and comparison identity;
+the nominal 32-token output cap is unsuitable for an unbounded thinking workflow.
+
+The result must contain integer `int64` input IDs and an all-one mask with shape
+`[1,P]`, where `1 <= P <= config.max_prompt_tokens <= 512`. Render-then-tokenize
+replay uses `add_special_tokens=False` and must produce identical IDs, preventing
+duplicate special tokens or drift. Transfer specifies only the selected device,
+preserving integer dtype. `PreparedPrompt` retains CPU IDs, rendered text/hash
+and the canonical messages digest for later manifest assembly. Both EOS IDs stay
+in `LoadedReference.eos_token_ids`; prompt preparation does not replace them with
+the tokenizer's single EOS or forward generation settings into tokenization.
+
+Failures expose finite `ReferenceLoadingError.code` values for invalid config,
+environment mismatch, invalid/missing assets, model/template mismatch, loading
+failure, OOM or malformed prompts. Messages contain neither prompts nor native
+diagnostics, paths or credentials. Keyboard interruption propagates normally.
+
+Security review of the pinned stack remains deliberately bounded. The
+[Transformers kernel-loading bypass](https://github.com/advisories/GHSA-29pf-2h5f-8g72)
+requires excluding optional kernels and rejecting private attention metadata;
+eager or `trust_remote_code=False` alone is insufficient. Explicit native
+generation configuration and a closed local snapshot exclude custom-generation
+discovery. Fixed filenames/cache containment exclude Hub's broader
+[local-directory acquisition risks](https://github.com/huggingface/huggingface_hub/releases/tag/v1.26.0).
+No Hub checkpoint helper, arbitrary shard index, pickle, Trainer, TorchScript,
+export or tokenizer-save path is used. This is not a clean-security certification.
+The implementation assumes no malicious concurrent mutation by the same account
+after validation; do not use an adversary-writable cache.
+
+Verification commands:
+
+```sh
+python -m unittest discover -s tests/unit -p "test_reference_loading.py" -v
+python scripts/verify.py
+```
+
+The opt-in `tests/integration/test_reference_loading.py` uses the existing locked
+CPU environment with `VORTEX_REFERENCE_TOKENIZER_API=1`. It tests the real
+Transformers 4.53.3 chat-template API with a tiny synthetic tokenizer, controlled
+artifact identities and small CPU input tensors. It never calls `load_reference`
+or constructs a model. Passing it verifies API compatibility only, not the real
+Qwen tokenizer, full asset hashes, pretrained loading, GPU/FP16, generated IDs,
+numerical parity or performance. Those remain **NOT VERIFIED**. No generation
+runner or decoding loop is implemented here.
+
+```mermaid
+flowchart TD
+    C[Immutable configuration] --> E[Locked environment preflight]
+    E --> A[Seven fixed assets: revision, sizes and identities]
+    A --> N[Native CPU construction and explicit device/dtype]
+    N --> V[Eval mode and configuration checks]
+    V --> T[Non-thinking template and integer inputs]
+    T --> P[Bounded prompt with IDs and identity hashes]
+    A -->|mismatch| F[Sanitized failure]
+    T -->|malformed or oversized| F
+```
 
 ## Schema 1
 
