@@ -1,8 +1,8 @@
 # Target runtime architecture (not implemented)
 
-Everything below is **planned architecture**, not working runtime functionality. The package currently contains namespace scaffolding; there is no inference server, scheduler, executor or physical KV cache. Phase 0 has not started and no runtime performance or capacity results exist.
+Everything below is **planned runtime architecture**. Offline reference configuration and manifest validation are implemented, and [reference dependency profiles](reference-environment.md) distinguish resolved locks and import checks from unverified execution. There is no inference server, scheduler, runtime executor or physical KV cache, and no runtime performance or capacity results exist.
 
-The first target is a *single-node, single-GPU* runtime for `Qwen/Qwen3-0.6B`, with Python 3.11+, PyTorch/Transformers execution and an OpenAI-style HTTP/SSE interface. Exact model revision, library versions, dtype and cache adapter remain to be selected and verified. `model.generate()` is allowed for the external baseline only, not as Vortex's engine. Multi-GPU execution, custom kernels and production service features are outside the initial scope. Spec and plan reviews precede each implementation phase.
+The first target is a *single-node, single-GPU* runtime for `Qwen/Qwen3-0.6B`, with Python 3.11+, PyTorch/Transformers execution and an OpenAI-style HTTP/SSE interface. The [reference configuration](reference-baseline.md) pins model/tokenizer revision and intended dtype/cache behavior; the dependency profiles select explicit library builds. These choices do not establish actual model or GPU compatibility. `model.generate()` is allowed for the external baseline only, not as Vortex's engine. Multi-GPU execution, custom kernels and production service features are outside the initial scope. Spec and plan reviews precede each implementation phase.
 
 ## Components and ownership
 

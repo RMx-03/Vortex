@@ -8,6 +8,10 @@ version = "0.0.0"
 description = "Starter for an experimental LLM inference runtime (runtime not yet implemented)"
 requires-python = ">=3.11"
 
+[project.optional-dependencies]
+baseline-cpu = ["torch==2.10.0+cpu", "transformers==4.53.3"]
+baseline-cuda = ["torch==2.10.0+cu126", "transformers==4.53.3"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 # Keep unrelated packages and implicit namespace directories out of the distribution.
