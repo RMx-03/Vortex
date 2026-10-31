@@ -1,9 +1,10 @@
-# Reference configuration, loading and manifest contract
+# Reference configuration, loading, generation and manifest contract
 
 The reference configuration and schema validators run offline with Python's
 standard library. They do not load a model, import inference libraries, probe
-devices or qualify an environment. Model inference, golden token capture and
-measurements are not implemented by these modules.
+devices or qualify an environment. Optional loading and HF generation adapters
+are separate from those validators. Real pretrained execution, golden token
+capture and measurements remain NOT VERIFIED.
 
 ## Immutable intended configuration
 
@@ -45,8 +46,7 @@ There is no system message or thinking suffix. `tokenize=True`,
 template's empty thinking block belongs to the input identity. Eager attention,
 no autocast/quantization/compilation, and a fresh model-owned `DynamicCache` per
 request are the intended execution contract. The loader enforces explicit eager
-loading; generation settings and per-request cache ownership belong to the later
-generation implementation.
+loading; the generation adapter enforces settings and per-request cache ownership.
 
 ## Loading and prompt preparation
 
@@ -190,8 +190,8 @@ Transformers 4.53.3 chat-template API with a tiny synthetic tokenizer, controlle
 artifact identities and small CPU input tensors. It never calls `load_reference`
 or constructs a model. Passing it verifies API compatibility only, not the real
 Qwen tokenizer, full asset hashes, pretrained loading, GPU/FP16, generated IDs,
-numerical parity or performance. Those remain **NOT VERIFIED**. No generation
-runner or decoding loop is implemented here.
+numerical parity or performance. Those remain **NOT VERIFIED**. The generation
+adapter below is tested separately; no custom decoding loop is implemented.
 
 ```mermaid
 flowchart TD
@@ -203,6 +203,140 @@ flowchart TD
     T --> P[Bounded prompt with IDs and identity hashes]
     A -->|mismatch| F[Sanitized failure]
     T -->|malformed or oversized| F
+```
+
+## Bounded Hugging Face reference generation
+
+`vortex.executor.reference_generation` imports without inference dependencies.
+Its APIs consume a matching validated `ReferenceConfig`, `LoadedReference` and
+`PreparedPrompt` from the loading adapter:
+
+```python
+generate_raw_reference(loaded, prompt, config) -> RawGenerationOutput
+materialize_generation(raw, loaded, prompt, config) -> GenerationResult
+generate_reference(loaded, prompt, config) -> GenerationResult
+```
+
+The convenience operation composes raw generation and materialization for untimed
+correctness work. It is the HF reference baseline, not Vortex's decoding engine.
+No weights are acquired by these functions. Real Qwen generation and GPU execution
+have **NOT BEEN VERIFIED**. Use only synthetic fixtures on the development laptop;
+real execution requires a separately authorized host and reviewed assets/profile.
+
+Each call constructs a new native `GenerationConfig` and passes
+`use_model_defaults=False`. The second control is essential in
+[Transformers 4.53.3](https://github.com/huggingface/transformers/blob/v4.53.3/src/transformers/generation/utils.py):
+otherwise fields equal to library defaults may be replaced from saved model
+defaults. A saved `do_sample=True`, temperature `.6`, top-p `.95`, top-k `20`
+therefore cannot change this comparison into sampling.
+
+| Explicit settings | Purpose |
+| --- | --- |
+| `do_sample=False`, one beam/group/return sequence | One greedy request, without sampling or beam alternatives |
+| `max_new_tokens=G`, `min_new_tokens=0` | At most G new tokens, with EOS allowed immediately |
+| `max_length=P+G`, `min_length=P` | Record the same normalized lengths used internally by the pinned library |
+| `eos_token_id=[151645,151643]`, `pad_token_id=bos_token_id=151643` | Preserve both approved stops and prevent special-ID fallback |
+| `temperature=top_p=1.0`, `top_k=50` | Neutral, inactive sampling defaults retained as numerical evidence |
+| `repetition_penalty=length_penalty=1.0`, `no_repeat_ngram_size=0` | No repetition or length preference |
+| `use_cache=True`, fresh `DynamicCache`, `logits_to_keep=1` | Isolated request state and the approved last-position projection |
+| Return dictionary; scores/logits/attentions/hidden states disabled | Return sequences/cache without retaining extra diagnostic tensors |
+| Empty custom processors/stopping criteria; no streamer, assistant, custom generator or `max_time`; `synced_gpus=False` | No caller-supplied execution hooks, string stops, distributed coordination or time-based early stop |
+
+The decoder-only path explicitly forwards `decoder_start_token_id=None` after
+default preparation. No arbitrary generation kwargs are accepted. Full native
+`GenerationConfig.to_dict()` evidence, including inactive fields/version, is
+serialized after generation; invocation controls stay in the schema's generation
+envelope. Saved model defaults are not mutated. Non-thinking mode belongs to
+prompt preparation (`enable_thinking=False`), never to an unsupported generate kwarg.
+
+Before execution, mutable input tensors are rechecked against their bounded CPU
+ID tuple, with integer `[1,P]` shape, explicit device and an all-one mask. Limits
+remain P <= 512 and 1 <= G <= 64, without truncation. The model must still be in
+eval mode with the matching eager profile. Calls enter a fresh inference context.
+Callers must serialize access and avoid concurrently mutating model/input objects.
+
+The raw result owns device sequences, its fresh cache and native configuration.
+Raw generation does no `.cpu()`, `.tolist()`, output slicing, decoding or record
+serialization. It includes validation, dependency/import checks and cache/config
+construction; any future interval timing that entire operation must say so.
+Synchronization and measurements are not implemented here. After timing,
+materialization checks integer `[1,P+g]` output, exact prompt prefix, vocabulary
+membership and `1 <= g <= G`, then extracts `sequence_ids[P:]`. Prompt IDs are
+never counted as output. The returned cache must be that request's `DynamicCache`
+with observed sequence length `P+g-1`; full per-layer cache inspection is separate.
+
+Both terminal EOS IDs remain in `generated_ids`. Tokens after an EOS and short
+non-EOS output are rejected. EOS wins when it coincides with G, while
+`reached_limit=True` independently records the cap. Raw decode uses
+`skip_special_tokens=False`; display decode uses `True`; both use
+`clean_up_tokenization_spaces=False`. Display text is never the parity oracle.
+
+`GenerationResult` contains `prompt_ids`, `sequence_ids`, `generated_ids` as tuples,
+`raw_text`, `display_text`, `stop_reason`, `reached_limit` and full
+`effective_generation_config`. Convert tuple IDs to JSON lists for schema 1.
+Finite `ReferenceGenerationError.code` values distinguish invalid config/prompt,
+environment mismatch, invalid output, failed execution and OOM. Failures return
+no successful output; no retry, token trimming or fallback occurs. Interruptions
+propagate. The convenience function drops its local raw/cache reference on exit;
+raw API callers own release. Native calls have token bounds, not hard wall-time
+or memory guarantees. No allocator reclamation or concurrency isolation is claimed.
+
+### CLI and verification
+
+`benchmarks/workloads/phase0-prompts.json` contains the three fixed synthetic
+messages A/B/C with nominal G=32. The CLI verifies their exact schema/content.
+Its default is configuration-only: it emits three schema-valid drafts with null
+numerical evidence/outputs and `complete=False`, without loading dependencies or
+assets. A draft has no tokenized workload identity yet. Source provenance is
+operator-supplied; use the actual reviewed commit and dirty/patch evidence.
+
+```sh
+python benchmarks/run_baseline.py --help
+python benchmarks/run_baseline.py --profile windows-cpu --source-sha "$(git rev-parse HEAD)"
+python -m unittest discover -s tests/unit -p "test_reference_generation.py" -v
+python scripts/verify.py
+```
+
+Future execution command, **only on a separately authorized host**, with reviewed
+cached assets and the matching profile (not executed during development):
+
+```sh
+PYTHONHASHSEED=0 CUBLAS_WORKSPACE_CONFIG=:4096:8 python benchmarks/run_baseline.py \
+  --profile t4-fp16 --source-sha "$(git rev-parse HEAD)" --workload A --execute --offline
+```
+
+The CLI rejects missing early environment settings before loading, sets seed zero
+for Python/NumPy/Torch, disables cuDNN benchmark/TF32 and enables strict deterministic
+algorithms. It emits one validated schema-1 manifest per request. `complete=True`
+means only that the request returned valid adapter output, not that the environment
+or pretrained outputs are independently qualified. Failure/interruption emits an
+incomplete manifest and finite stderr code; prior completed lines are retained.
+Exit codes: 0 drafts/request success, 2 invalid preflight/arguments, 3 request failure,
+130 interruption. Keep stdout captures outside the public checkout; no durable
+export, timing, golden comparison or automatic publication is implemented.
+
+`tests/integration/test_reference_generation.py` is opt-in with
+`VORTEX_REFERENCE_GENERATION_API=1` inside the existing locked CPU environment. It
+uses real 4.53.3 configuration/default-preparation and `DynamicCache` APIs, tiny
+Torch tensors and a stub generation call. It never constructs Qwen, calls a model
+forward, downloads weights or runs actual HF decoding. Unit/mock determinism and
+this API check are not evidence of pretrained token correctness. Actual Qwen
+tokenizer/model loading, EOS/cache behavior, native Linux/CUDA/FP16, repeated token
+parity and performance remain **NOT VERIFIED**.
+
+```mermaid
+flowchart TD
+    C[Validated pinned configuration and loaded model] --> P[Non-thinking prepared inputs]
+    P --> V[Recheck integer IDs, mask and token bounds]
+    V --> G[Fresh greedy config and DynamicCache]
+    G --> H[HF generate with model defaults disabled]
+    H --> R[Raw device sequences and cache]
+    R --> M[After timing: validate prefix, IDs and EOS]
+    M --> O[Generated IDs plus raw and display text]
+    O --> J[Schema-1 request evidence]
+    V -->|invalid| F[Sanitized incomplete failure]
+    H -->|execution failure| F
+    M -->|malformed output| F
 ```
 
 ## Schema 1
@@ -231,9 +365,9 @@ The generation envelope records explicit greedy settings and invocation controls
 It is **not** an object to pass directly as `generate(**envelope)`:
 `use_model_defaults`, `forward_kwargs`, cache strategy and the absence of custom
 processors are invocation metadata. Only the stated generation settings are
-supported. The future adapter must create a fresh `GenerationConfig`, pass
-`use_model_defaults=False`, supply a fresh `DynamicCache`, and record the full
-effective library configuration when that adapter is implemented. In particular,
+supported. The adapter creates a fresh `GenerationConfig`, passes
+`use_model_defaults=False`, supplies a fresh `DynamicCache`, and records the full
+effective library configuration after execution. In particular,
 the pinned model's saved sampling defaults must never re-enable sampling.
 Actual Transformers behavior and effective-config capture are NOT VERIFIED by
 this offline schema check.

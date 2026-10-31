@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "workloads": [
+    {
+      "id": "A",
+      "messages": [{"role": "user", "content": "Reply with the single word vortex."}],
+      "max_new_tokens": 32
+    },
+    {
+      "id": "B",
+      "messages": [{"role": "user", "content": "What is 2 + 2? Answer briefly."}],
+      "max_new_tokens": 32
+    },
+    {
+      "id": "C",
+      "messages": [{"role": "user", "content": "Explain a key-value cache in one short sentence."}],
+      "max_new_tokens": 32
+    }
+  ]
+}
