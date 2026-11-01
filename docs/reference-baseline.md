@@ -339,6 +339,110 @@ flowchart TD
     M -->|malformed output| F
 ```
 
+## Offline token comparison
+
+`scripts/compare_reference.py` implements the standard-library-only contract:
+
+```python
+compare_reference(expected: Mapping[str, object], actual: Mapping[str, object]) -> ComparisonResult
+```
+
+Inputs are schema-1 manifests, not bare token lists or decoded strings. Each input
+is copied through the existing bounded canonical JSON snapshot and validated before
+use. No caller-owned mapping is reread after validation and no input is mutated.
+The comparator additionally enforces the pinned vocabulary range `0 <= ID < 151936`
+for prompt and generated IDs. No model, tensor, GPU, network or inference package
+is needed. Tests use controlled synthetic records, not qualified pretrained goldens.
+
+Comparison has three separate concerns:
+
+1. **Numerical comparability:** both manifests must be valid, complete and contain
+   numerical evidence. Their recomputed `comparison_key_sha256` values must match.
+   This covers configuration, input IDs/template/assets, full effective generation
+   configuration, environment/build/wheel/hardware evidence and determinism.
+2. **Provenance:** source commit/dirty patch, adapter version, run/session IDs and
+   timestamp remain required and validated. Differences in those fields alone do
+   not prevent numerical comparison. Source changes still require review and later
+   requalification before accepting a new golden.
+3. **Outcome:** eligible generated token lists and their lengths are compared
+   exactly, including terminal EOS. Equal configuration digests or numerical keys
+   alone cannot produce a match. Decoded raw/display strings are not compared.
+
+`ComparisonResult` is a frozen dataclass with exactly these report fields:
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `MATCH`, `MISMATCH` or `INCOMPATIBLE` |
+| `first_mismatch` | Zero-based position in generated IDs, including EOS; otherwise `null` |
+| `reason` | Finite machine-readable reason code, without raw inputs or native diagnostics |
+
+`MATCH` uses `identical_tokens`. Eligible equal-length differing outputs use
+`token_mismatch`. Different counts use `output_length_mismatch`, with the earliest
+unequal token position, or the first missing position for a strict prefix. Under
+schema 1, successful outputs contain 1–G IDs, G <= 64; zero output is invalid.
+Immediate EOS and EOS at the cap are valid; EOS wins while `reached_limit`
+independently records length. Post-EOS tokens, missing terminal EOS on a short
+output, inconsistent prompt prefixes or stop metadata are malformed evidence and
+return `INCOMPATIBLE`, rather than being silently trimmed or ordinarily compared.
+
+Incompatible reasons are `invalid_reference`, `incomplete_reference`,
+`invalid_candidate`, `incomplete_candidate` and `numerical_identity_mismatch`.
+Their `first_mismatch` is always null. Reference validity/completeness is checked
+first, before inspecting the candidate. The same bounded malformed inputs always
+produce the same report; prompts, paths, source identifiers and token values are
+not included in mismatch reports. Library interruption propagates normally.
+
+These are illustrative reports for synthetic evidence only:
+
+```json
+{"first_mismatch":null,"reason":"identical_tokens","status":"MATCH"}
+{"first_mismatch":1,"reason":"token_mismatch","status":"MISMATCH"}
+{"first_mismatch":null,"reason":"numerical_identity_mismatch","status":"INCOMPATIBLE"}
+```
+
+The CLI accepts two existing local UTF-8 JSON files. Replace the uppercase
+placeholders with actual file paths; keep real experiment records outside Git.
+
+```sh
+python scripts/compare_reference.py --expected EXPECTED_JSON --actual CANDIDATE_JSON
+python -m unittest discover -s tests/unit -p "test_reference_comparison.py" -v
+python scripts/verify.py
+```
+
+It prints one compact key-sorted JSON report, with exit codes 0/1/2 for
+MATCH/MISMATCH/INCOMPATIBLE and 130 for interruption. Missing/malformed, duplicate
+key, nonfinite, non-UTF-8 or oversized files produce finite incompatible reports.
+Each read is limited to 1 MiB plus one sentinel byte; canonical validation also
+has a 1 MiB work/encoding budget and 32 nesting levels. URLs, UNC paths, symlink
+files and nonregular files are rejected. Use operator-controlled local files;
+filesystem operations have no hard wall-time guarantee, and arbitrary Python
+Mapping methods are not sandboxed. There is no write/update/repair/golden option.
+Subprocess CLI checks and fresh-process report replay are included in the unit
+suite, so this task needs no separate integration dependency or test file.
+
+**Qualification is separate:** schema 1 carries no independent golden-approval
+attestation. `complete=True` describes a successful request, and `MATCH` describes
+the supplied tokens; neither certifies actual execution or a pretrained golden.
+Incomplete/missing numerical evidence is rejected here. Independently qualified
+real reference evidence still requires a verified environment, actual authorized
+model execution, three fresh-cache repeats, one fresh-process replay and review.
+No unqualified or synthetic record is promoted to a golden by this tool. That
+capture/qualification work, actual Qwen parity and GPU behavior remain
+**NOT VERIFIED** and require separate authorization.
+
+```mermaid
+flowchart TD
+    R[Reference and candidate manifests] --> V[Bounded owned snapshots and validation]
+    V --> C[Require complete numerical evidence]
+    C --> K[Compare numerical keys]
+    K -->|different| I[INCOMPATIBLE]
+    K -->|equal| T[Compare generated IDs and counts]
+    T -->|equal| M[MATCH]
+    T -->|different| D[MISMATCH with first position]
+    V -->|invalid| I
+    C -->|incomplete| I
+```
+
 ## Schema 1
 
 `validate_manifest(record: Mapping[str, object]) -> None` validates an owned JSON
