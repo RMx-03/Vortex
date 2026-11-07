@@ -637,7 +637,8 @@ They establish offline validation and identity behavior, not pretrained
 correctness, environment compatibility, device behavior or performance.
 The actual greedy call must separately prove saved model defaults cannot enable
 sampling. Golden acceptance requires reviewed same-fingerprint repeats and a
-fresh-process replay; that comparison and qualification are future work.
+fresh-process replay. The offline comparator and opt-in capture controller are
+implemented; actual pretrained capture and golden qualification remain NOT VERIFIED.
 
 Keep real run records, raw token evidence, file inventories and environment
 qualification evidence outside the public checkout. Review exact working files
@@ -657,5 +658,70 @@ flowchart LR
     G --> H[Supplied numerical evidence]
     H --> I[Numerical comparison key]
     P[Separate source and run provenance] --> F
-    I --> J[Future qualification and exact token comparison]
+    I --> J[Exact comparison and separate qualification gates]
+```
+
+## Bounded GPU capture and qualification
+
+The [GPU harness and exact controls](../tests/gpu/README.md) reuse the existing
+loader, generator, schema-1 validator, immutable environment lock and comparator.
+Default discovery is CPU-safe; real execution requires separately approved Linux
+T4/FP16/eager controls, a clean reviewed commit containing the harness, actual
+driver/security/resource verification and exact Python/uv executable identities.
+The uv 0.10.7 archive/executable integrity review remains blocking. Static wheel
+metadata does not qualify Linux CUDA execution. No real model/GPU/cloud run has
+been performed for this implementation.
+
+The controller first runs an offline missing-asset probe in a separate fresh
+process/cache. It initializes strict determinism before a tiny native GPU smoke,
+stream-verifies the closed seven-asset pinned revision before model loading, then
+uses offline guarded loads. One primary process/model captures three fresh-cache
+repeats of each approved prompt; a newly launched offline interpreter/model replays
+each once. The twelve records are `A1,A2,A3,B1,B2,B3,C1,C2,C3,A4,B4,C4`.
+Nine same-prompt comparisons pair each first capture with 2, 3 and 4. A mismatch
+or incompatible numerical identity is persisted and stops further requests.
+
+The parent supervises ordered, bounded JSON events and acknowledges a stage only
+after durable record writes/readback. Native hangs, crashes, OOM, output overflow
+and interruption terminate the worker tree and preserve incomplete attempts.
+Generation has a 120-second wall ceiling; asset acquisition/first load shares one
+1200-second deadline, within primary/replay/session ceilings. These are failure
+limits, not performance measurements or valid shortened generations. There is no
+retry, dtype/offload fallback or automatic golden replacement.
+
+Private manifests preserve raw IDs, EOS/limit information, counts and complete
+numerical identity. Atomic writes and immutable closed archives retain successful
+and incomplete evidence. The capture index excludes itself/hash; mutable
+qualification statuses, export receipts and later human approval stay external to
+both index and archive, bound to the immutable index hash. Primary checkpoints
+and final captures have separate immutable identities. Actual downloaded archives
+must be reopened and fully verified at the durable private destination. A
+cloud-only checksum or successful generation cannot establish export completion.
+
+These are separate gates: successful execution; complete evidence capture;
+numerical comparability; exact token parity; independent evidence review; human
+golden approval. Capture/export completion markers never approve a golden. The
+controller preserves the verifier's original `qualified:false` import report and
+stores tiny-smoke qualification separately. Schema 1 and its comparison contract
+remain unchanged. Synthetic success/failure tests establish controller behavior
+only; actual pinned weights/tokenization/inference, Linux CUDA, twelve real
+captures, destination export and golden approval remain NOT VERIFIED.
+
+```mermaid
+flowchart TD
+    A[Separate execution approval and exact reviewed source] --> B[Parent supervisor and incomplete ledger]
+    B --> N[Fresh offline-negative process and empty cache]
+    N --> C[Primary: environment, determinism and tiny FP16 smoke]
+    C --> D[Verify seven assets before guarded offline model load]
+    D --> E[A1 A2 A3 B1 B2 B3 C1 C2 C3 in one process]
+    E --> F[Reap primary and freeze checkpoint]
+    F --> G[Fresh offline replay process: A4 B4 C4]
+    E --> H[Nine exact same-prompt comparisons as records arrive]
+    G --> H
+    H --> I[Validate full evidence, seal immutable capture and archive]
+    I --> J[Authorized private transfer and destination reopen]
+    J --> K[External receipt and capture qualification status]
+    K --> L[Independent evidence audit]
+    L --> M[Separate human golden approval]
+    N & C & D & E & G & H & I & J --> X[Failure: kill worker tree, retain incomplete evidence, stop]
 ```
