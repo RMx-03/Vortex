@@ -129,6 +129,42 @@ def validate_lock(lock: Mapping[str, object]) -> None:
 
 
 def _strict_json(text: str) -> object:
+    """Decode at most 1 MiB UTF-8 and 32 container levels, before parser recursion.
+
+    A root object/array counts as level 1; scalars count as 0. The linear scan
+    ignores quoted/escaped delimiters and stores at most 32 opening delimiters.
+    This matches the manifest's bounded-depth policy and admits the reviewed
+    lock/receipt structures. The standard decoder still owns full JSON grammar.
+    """
+    if not isinstance(text, str) or len(text) > 1_048_576:
+        raise ValueError("JSON size exceeds limit")
+    try:
+        if len(text.encode("utf-8")) > 1_048_576:
+            raise ValueError("JSON size exceeds limit")
+    except UnicodeError:
+        raise ValueError("invalid JSON text") from None
+    stack = []
+    quoted = escaped = False
+    for character in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+        elif character == '"':
+            quoted = True
+        elif character in "[{":
+            if len(stack) == 32:
+                raise ValueError("JSON nesting exceeds limit")
+            stack.append(character)
+        elif character in "]}":
+            if not stack or stack.pop() != ("[" if character == "]" else "{"):
+                raise ValueError("invalid JSON structure")
+    if quoted or stack:
+        raise ValueError("invalid JSON structure")
+
     def pairs(items):
         value = {}
         for key, item in items:
@@ -142,6 +178,8 @@ def _strict_json(text: str) -> object:
 
     try:
         return json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
+    except json.JSONDecodeError:
+        raise ValueError("invalid JSON") from None
     except RecursionError:
         raise ValueError("JSON nesting exceeds limit") from None
 

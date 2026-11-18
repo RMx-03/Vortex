@@ -198,6 +198,67 @@ class EnvironmentContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             environment._strict_json("[" * 2000 + "0" + "]" * 2000)
 
+    def test_json_accepts_depth_32_and_rejects_depth_33(self):
+        value = environment._strict_json("[" * 32 + "0" + "]" * 32)
+        for _ in range(32):
+            self.assertEqual(len(value), 1)
+            value = value[0]
+        self.assertEqual(value, 0)
+        with self.assertRaisesRegex(ValueError, "nesting"):
+            environment._strict_json("[" * 33 + "0" + "]" * 33)
+
+    def test_json_counts_objects_and_mixed_containers(self):
+        for layout in ("o" * 32, "ao" * 16):
+            prefix = "".join("[" if kind == "a" else '{"v":' for kind in layout)
+            suffix = "".join("]" if kind == "a" else "}" for kind in reversed(layout))
+            value = environment._strict_json(prefix + "0" + suffix)
+            for kind in layout:
+                value = value[0] if kind == "a" else value["v"]
+            self.assertEqual(value, 0)
+            with self.subTest(layout=layout), self.assertRaisesRegex(ValueError, "nesting"):
+                environment._strict_json("[" + prefix + "0" + suffix + "]")
+
+    def test_json_quoted_brackets_and_escaped_characters_are_not_nesting(self):
+        for count in range(5):
+            literal = "\\" * count + '"' + "[{}]" * 40 + "\\" * count
+            expected = {"[{]}": literal, "tail": []}
+            encoded = json.dumps(expected)
+            self.assertEqual(environment._strict_json(encoded), expected)
+            # Thirty arrays + object + tail array = 32 structural levels,
+            # regardless of bracket characters or odd/even slash runs.
+            value = environment._strict_json("[" * 30 + encoded + "]" * 30)
+            for _ in range(30):
+                value = value[0]
+            self.assertEqual(value, expected)
+
+    def test_json_depth_is_rejected_before_calling_the_decoder(self):
+        for text in ("[" * 33 + "0" + "]" * 33, '{"v":' * 33 + "0" + "}" * 33,
+                     "[" * 2000):
+            with patch.object(environment.json, "loads", side_effect=AssertionError("decoder reached")):
+                with self.subTest(length=len(text)), self.assertRaisesRegex(ValueError, "nesting"):
+                    environment._strict_json(text)
+
+    def test_json_size_limit_counts_utf8_bytes(self):
+        for content, extra in (("x" * 1_048_574, "x"), ("é" * 524_287, "é")):
+            self.assertEqual(environment._strict_json('"' + content + '"'), content)
+            with patch.object(environment.json, "loads", side_effect=AssertionError("decoder reached")):
+                with self.assertRaisesRegex(ValueError, "size"):
+                    environment._strict_json('"' + content + extra + '"')
+
+    def test_json_duplicate_keys_and_nonfinite_numbers_remain_rejected(self):
+        for text in ('{"v":1,"v":2}', '{"v":NaN}', '{"v":Infinity}', '{"v":-Infinity}'):
+            for prefix, suffix in (("", ""), ("[" * 31, "]" * 31)):
+                with self.subTest(text=text), self.assertRaises(ValueError):
+                    environment._strict_json(prefix + text + suffix)
+
+    def test_malformed_json_errors_are_bounded_and_do_not_echo_input(self):
+        for text in ("", "[}", '{"v":[}', '["unterminated', '["tail\\', '{"v" 1}',
+                     "[1,]", "[] trailing", '"\\q"', "]", '{"sensitive-marker":?}'):
+            with self.subTest(text=text), self.assertRaises(ValueError) as caught:
+                environment._strict_json(text)
+            self.assertLess(len(str(caught.exception)), 100)
+            self.assertNotIn("sensitive-marker", str(caught.exception))
+
     def test_cli_missing_dependency_has_actionable_code(self):
         output = io.StringIO()
         with patch.object(environment, "read_lock", return_value=lock_fixture()), \
@@ -228,20 +289,26 @@ class EnvironmentContractTests(unittest.TestCase):
                                        "archive_info": {"hashes": {"sha256": "b" * 64}}}))
 
         original_import = builtins.__import__
+        native_imports = []
 
         def block_native(name, *args, **kwargs):
-            if name in ("torch", "transformers"):
+            if name.split(".")[0] in ("torch", "transformers"):
+                native_imports.append(name)
                 raise AssertionError("unreviewed native import reached")
             return original_import(name, *args, **kwargs)
 
         records = [SimpleNamespace(metadata={"Name": name}) for name in packages]
         with patch.object(environment.importlib.metadata, "distribution", side_effect=distribution), \
                 patch.object(environment.importlib.metadata, "distributions", return_value=records), \
-                patch.object(environment.platform, "python_version", return_value="3.11.18"), \
+                patch.object(environment.platform, "python_version", return_value=lock["python_version"]), \
+                patch.object(environment.platform, "system", return_value=lock["system"]), \
+                patch.object(environment.platform, "machine", return_value=lock["machine"]), \
+                patch.object(environment.platform, "python_implementation", return_value=lock["implementation"]), \
                 patch.object(environment.sys, "addaudithook"), \
                 patch("builtins.__import__", side_effect=block_native):
             with self.assertRaisesRegex(ValueError, "wheel"):
                 environment._inspect(lock)
+        self.assertEqual(native_imports, [])
 
     def test_wrong_interpreter_rejected_before_package_inspection(self):
         with patch.object(environment.platform, "python_version", return_value="3.12.0"), \
@@ -251,6 +318,22 @@ class EnvironmentContractTests(unittest.TestCase):
             with self.assertRaises(environment.EnvironmentFailure) as caught:
                 environment._inspect(lock_fixture())
         self.assertEqual(caught.exception.code, "INTERPRETER_MISMATCH")
+
+    def test_wrong_platform_rejected_before_package_inspection(self):
+        lock = lock_fixture()
+        for key, wrong in (("system", "Linux"), ("machine", "ARM64"), ("implementation", "PyPy")):
+            identity = {name: lock[name] for name in ("python_version", "system", "machine", "implementation")}
+            identity[key] = wrong
+            with patch.object(environment.platform, "python_version", return_value=identity["python_version"]), \
+                    patch.object(environment.platform, "system", return_value=identity["system"]), \
+                    patch.object(environment.platform, "machine", return_value=identity["machine"]), \
+                    patch.object(environment.platform, "python_implementation", return_value=identity["implementation"]), \
+                    patch.object(environment.sys, "addaudithook"), \
+                    patch.object(environment.importlib.metadata, "distribution", side_effect=AssertionError(
+                        "wrong platform reached package inspection")):
+                with self.subTest(key=key), self.assertRaises(environment.EnvironmentFailure) as caught:
+                    environment._inspect(lock)
+            self.assertEqual(caught.exception.code, "INTERPRETER_MISMATCH")
 
     def test_dependency_check_and_optional_kernel_failures(self):
         for key, value in (("pip_check", False), ("api_contract", False),
