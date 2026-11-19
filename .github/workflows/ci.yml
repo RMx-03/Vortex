@@ -95,3 +95,44 @@ jobs:
           import subprocess
           import sys
           raise SystemExit(subprocess.call([sys.executable, '-B', 'scripts/verify.py']))
+      - name: CPU-only GPU harness fixtures (GPU NOT VERIFIED)
+        shell: python
+        run: |
+          import os
+          import re
+          import subprocess
+          import sys
+
+          # The real GPU test checks presence, so remove controls rather than setting 0.
+          environment = {key: value for key, value in os.environ.items()
+                         if not key.startswith('VORTEX_GPU_')}
+          environment['PYTHON_COLORS'] = '0'
+          try:
+              result = subprocess.run(
+                  [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests/gpu',
+                   '-p', 'test_reference_parity.py', '-v'],
+                  env=environment, stdin=subprocess.DEVNULL, capture_output=True,
+                  text=True, encoding='utf-8', errors='replace', timeout=300, check=False)
+          except (OSError, subprocess.TimeoutExpired):
+              print('ERROR: CPU synthetic harness could not complete within its execution bound.',
+                    file=sys.stderr)
+              raise SystemExit(2)
+          sys.stdout.write(result.stdout)
+          sys.stderr.write(result.stderr)
+          if result.returncode:
+              raise SystemExit(result.returncode)
+
+          counts = re.findall(r'^Ran ([0-9]+) tests? in ', result.stderr, re.MULTILINE)
+          expected_skip = (
+              'test_gpu_capture_unreviewed (test_reference_parity.GPUCaptureTests.'
+              'test_gpu_capture_unreviewed) ... skipped '
+              "'NOT VERIFIED: GPU capture requires explicit approved Linux execution controls'")
+          # Keep the reviewed 42-test floor; added passing fixtures need no CI edit.
+          if (len(counts) != 1 or int(counts[0]) < 42
+                  or not re.search(r'^OK \(skipped=1\)\s*$', result.stderr, re.MULTILINE)
+                  or expected_skip not in result.stderr.splitlines()):
+              print('FAIL: require at least 42 tests, no expected failures, and only the deliberate GPU skip.',
+                    file=sys.stderr)
+              raise SystemExit(1)
+          print(f'PASS: {int(counts[0]) - 1} CPU synthetic tests; 1 deliberate GPU skip '
+                '(GPU qualification NOT VERIFIED).')
