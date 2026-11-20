@@ -668,9 +668,12 @@ loader, generator, schema-1 validator, immutable environment lock and comparator
 Default discovery is CPU-safe; real execution requires separately approved Linux
 T4/FP16/eager controls, a clean reviewed commit containing the harness, actual
 driver/security/resource verification and exact Python/uv executable identities.
-The uv 0.10.7 archive/executable integrity review remains blocking. Static wheel
-metadata does not qualify Linux CUDA execution. No real model/GPU/cloud run has
-been performed for this implementation.
+Linux bootstrap pins uv 0.13.8 and the exact Python 3.11.18 standalone build
+20261026. Archive provenance, measured executable hashes, and installed wheel
+receipts must be verified separately on the approved host. Primary and replay
+bind to the same source-specific execution approval. The separate worker
+hash-seed isolation correction remains a capture prerequisite. Linux CUDA and
+pretrained execution remain NOT VERIFIED.
 
 The controller first runs an offline missing-asset probe in a separate fresh
 process/cache. It initializes strict determinism before a tiny native GPU smoke,

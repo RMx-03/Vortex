@@ -35,8 +35,9 @@ release are:
 | `cpython-3.11.18+20261026-x86_64-pc-windows-msvc` | `67215a7bf1643e33d01b17ee3f1e91a8b0b39163746855ee02594bf0608f68b4` |
 | `cpython-3.11.18+20261026-x86_64-unknown-linux-gnu` | `17c4978a36c496dc53c08899ef8dad1ad2734f6325f08d6033a1e66419e0af26` |
 
-The pinned download-metadata snapshot in the setup command supplies these hashes
-to uv. Verify the archive identity before accepting a replacement or mirror.
+The historical Windows setup used a pinned uv download-metadata snapshot.
+The Linux setup selects the verified archive directly. A patch version alone
+does not identify a standalone build.
 
 ## Lock format and sources
 
@@ -85,7 +86,9 @@ Choose all destinations outside the public checkout. The following paths are
 examples of operator-controlled private locations. The utility refuses to
 overwrite an existing requirements file or write it inside the checkout.
 
-Windows, with uv 0.10.7 and the pinned Astral metadata snapshot:
+Historical Windows verification used uv 0.10.7 and the pinned metadata snapshot
+below. New Windows setup using this recipe is blocked pending separate security
+review. The Linux migration does not requalify Windows or change its wheel lock.
 
 ```powershell
 uv python install 3.11.18 --python-downloads-json-url https://raw.githubusercontent.com/astral-sh/uv/0.13.6/crates/uv-python-managed/download-metadata.json --install-dir D:/vortex-environments/python --no-bin --no-registry
@@ -105,19 +108,66 @@ registration. The distribution source is a reproducibility/trust decision; a
 different interpreter build gets different numerical evidence even at the same
 patch version.
 
-On an authorized Linux GPU host, first install/verify the exact locked Python
-build and uv 0.10.7. Create an unseeded environment and sync the exact inventory;
-the Python 3.11 standard venv seeds setuptools, which is outside these locks.
+### Linux cloud bootstrap (blocked pending verification)
+
+Select the immutable Astral archive
+`cpython-3.11.18+20261026-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz`
+from the release above. Verify the archive hash and signed provenance before
+confined extraction, then hash the resolved Python executable and record its
+full build. The uv 0.13.8 managed catalog selects a different build for 3.11.18.
+Pass the verified absolute Python path and disable managed downloads.
+
+The Linux control tool is [uv 0.13.8](https://github.com/astral-sh/uv/releases/tag/0.13.8),
+asset `uv-x86_64-unknown-linux-gnu.tar.gz`, with expected archive SHA-256
+`5acfd9177cfecf0bf87578f059728215ccc884388988f55f7a65041b57387d91`.
+Verify the archive bytes and signed provenance independently before extraction.
+Hash the resolved uv executable before invoking it and bind the measured hash
+to the source-specific execution approval. Archive bytes, executable hashes,
+and on-host compatibility are pending verification.
+
+The commands below apply only to a separately authorized host after those
+checks and review of the effective Python libraries and installer TLS paths.
+Use a fresh owner-only directory and sanitized environment without inherited
+proxy settings, credentials, installer configuration or unreviewed cache.
+Review the effective CA store, endpoints and redirects for each network client.
+The venv step is offline and unseeded. The install steps use the locked HTTPS
+wheel URLs.
 
 ```sh
-uv venv --no-project --python python3.11 /private/vortex/t4-fp16
-python3.11 scripts/verify_reference_environment.py --profile t4-fp16 --emit-requirements /private/vortex/t4-fp16-requirements.txt
-python3.11 scripts/verify_reference_environment.py --profile t4-fp16 --bootstrap-only --emit-requirements /private/vortex/pip-bootstrap.txt
-uv pip install --python /private/vortex/t4-fp16/bin/python --no-deps --require-hashes -r /private/vortex/pip-bootstrap.txt
-/private/vortex/t4-fp16/bin/python -I -m pip install --force-reinstall --no-input --require-hashes -r /private/vortex/t4-fp16-requirements.txt
-/private/vortex/t4-fp16/bin/python -m pip check
-/private/vortex/t4-fp16/bin/python scripts/verify_reference_environment.py --profile t4-fp16
+set -eu
+# BASE is outside the checkout. UV_EXACT and PYTHON_EXACT are verified absolute paths.
+"$UV_EXACT" --no-config --offline --no-python-downloads --no-cache \
+  venv --no-project --python "$PYTHON_EXACT" "$BASE/t4-fp16"
+"$PYTHON_EXACT" scripts/verify_reference_environment.py --profile t4-fp16 \
+  --emit-requirements "$BASE/t4-fp16-requirements.txt"
+"$PYTHON_EXACT" scripts/verify_reference_environment.py --profile t4-fp16 \
+  --bootstrap-only --emit-requirements "$BASE/pip-bootstrap.txt"
 ```
+
+Before installation, verify that the venv resolves to the approved interpreter.
+Compare and retain the exact UTF-8 LF requirements bytes. Stop on any mismatch.
+
+| Generated file | Expected SHA-256 |
+| --- | --- |
+| `t4-fp16-requirements.txt` | `e04a807a789efe1dc8f024097da29b9506209dd96f9b9f14633318e3dc588f27` |
+| `pip-bootstrap.txt` | `a52429ad10574417dca41969f40342c37375e8971760da1f4eb981d252fb32bb` |
+
+```sh
+set -eu
+"$UV_EXACT" --no-config --no-python-downloads --no-cache pip install \
+  --python "$BASE/t4-fp16/bin/python" --no-deps --require-hashes \
+  --keyring-provider disabled -r "$BASE/pip-bootstrap.txt"
+PIP_CONFIG_FILE=/dev/null "$BASE/t4-fp16/bin/python" -I -m pip \
+  --disable-pip-version-check --no-input --no-cache-dir --keyring-provider disabled \
+  install --force-reinstall --require-hashes -r "$BASE/t4-fp16-requirements.txt"
+PIP_CONFIG_FILE=/dev/null "$BASE/t4-fp16/bin/python" -I -m pip \
+  --disable-pip-version-check check
+PIP_CONFIG_FILE=/dev/null "$BASE/t4-fp16/bin/python" \
+  scripts/verify_reference_environment.py --profile t4-fp16
+```
+
+Run each shell block with fail-fast behavior as shown. A failed install or
+`pip check` stops setup before the native-import verifier.
 
 The verifier checks exact patch, platform, wheel-origin hashes recorded by the
 installer, package versions, pip consistency and required APIs. It reuses the
@@ -126,10 +176,10 @@ native diagnostics are suppressed and public failures contain bounded reason
 codes with remediation. Missing dependencies, wrong interpreter, import errors
 and timeouts do not become a successful profile.
 
-The two installer steps are intentional. uv 0.10.7 can enforce installation
-hashes while writing empty PEP 610 archive-hash fields. It bootstraps only the
-locked pip wheel here. Pip then installs the complete lock, including itself,
-and records verifiable archive hashes. The verifier refuses missing or stale
+The historical uv 0.10.7 verification observed empty PEP 610 archive-hash fields
+despite enforced install hashes. The Linux procedure retains the two-step
+contract. uv bootstraps only the locked pip wheel. Pip then installs the complete
+lock, including itself, and records verifiable archive hashes. The verifier refuses missing or stale
 hash receipts before importing native libraries; it never fills them from the
 expected lock to make an environment appear verified.
 

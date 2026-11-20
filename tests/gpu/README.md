@@ -41,14 +41,15 @@ FP16/eager. Driver compatibility floor 560.35.05 is separate from security
 clearance. A current execution-specific security review must approve the actual
 driver and pinned dependency paths before native imports. No automatic upgrades.
 
-**uv 0.10.7 integrity remains a blocking prerequisite.** Obtain and independently
-review the official immutable archive/checksum and resolved executable identity;
-record both hashes before using it to create the environment. This harness
-verifies approved executable hashes; it does not acquire or independently attest
-the archive. A version string, placeholder digest, newest installer or successful
-wheel metadata check cannot replace that review. Likewise verify the approved
-Python archive before extraction and record the resolved interpreter hash and
-full `sys.version`. No installation is performed by this harness.
+**uv 0.13.8 integrity remains a blocking prerequisite.** Independently verify
+the official Linux archive's bytes and signed provenance before extraction.
+Verify the resolved uv executable hash before use. The harness enforces the
+expected archive digest in the approval and checks the resolved executable
+against the independently measured hash. The operator verifies archive
+provenance separately. Use the exact verified Python 20261026 executable and
+offline venv procedure in the locked environment instructions. The managed uv
+catalog can otherwise select a different build of Python 3.11.18. On-host tool
+and setup verification remain pending.
 
 ## Exact opt-in controls
 
@@ -77,16 +78,21 @@ schema extension. It has exactly these fields:
 - `security_reviewed: true`, exact `driver_version`, `reviewed_utc` in UTC within
   the preceding 24 hours, and integer `remaining_free_seconds` from 1 to 5400.
 - `tools`, containing exactly `python_archive_sha256`,
-  `python_executable_sha256`, `python_sys_version`, `uv_version: "0.10.7"`,
+  `python_executable_sha256`, `python_sys_version`, `uv_version: "0.13.8"`,
   `uv_archive_sha256`, `uv_executable_sha256`, `uv_identity_reviewed: true`, and
-  `uv_release: "https://github.com/astral-sh/uv/releases/tag/0.10.7"`.
+  `uv_release: "https://github.com/astral-sh/uv/releases/tag/0.13.8"`.
 
 The approved Python archive SHA256 is
 `17c4978a36c496dc53c08899ef8dad1ad2734f6325f08d6033a1e66419e0af26`.
-All other tool hashes must come from the separate identity review. Symlinked
-venv interpreters are checked against their resolved regular executable. The
-approval must authorize the actual free session and bounds; setting environment
-variables alone is not permission. A missing or incompatible gate fails BLOCKED.
+The required Linux uv archive SHA256 is
+`5acfd9177cfecf0bf87578f059728215ccc884388988f55f7a65041b57387d91`.
+Both executable hashes must come from the separate identity review. Symlinked
+venv interpreters are checked against their resolved regular executable. Use
+one approval for primary and replay, bound to the new reviewed source SHA and
+the actual free session. A missing or incompatible gate fails BLOCKED.
+The separate worker hash-seed isolation correction is also required before
+real capture. For historical evidence, use the original reviewed source SHA
+for read-only reopen.
 
 After all prerequisites and controls are approved, use the exact environment's
 Python executable with the discovery command above. It runs one real capture

@@ -42,6 +42,10 @@ from compare_reference import compare_reference
 
 LIMIT = 1_048_576
 TOTAL_LIMIT = 32 * LIMIT
+UV_VERSION = "0.13.8"
+UV_RELEASE = f"https://github.com/astral-sh/uv/releases/tag/{UV_VERSION}"
+# Expected digest of the official Linux x86-64 GNU release archive.
+UV_ARCHIVE_SHA256 = "5acfd9177cfecf0bf87578f059728215ccc884388988f55f7a65041b57387d91"
 CAPTURES = ("A1", "A2", "A3", "B1", "B2", "B3", "C1", "C2", "C3", "A4", "B4", "C4")
 PAIRS = tuple(f"{prompt}1-{prompt}{repeat}" for prompt in "ABC" for repeat in (2, 3, 4))
 NATIVE_FAILURES = frozenset(("OUT_OF_MEMORY", "GENERATION_FAILED", "INVALID_OUTPUT", "LOAD_FAILED",
@@ -557,6 +561,8 @@ def validate_execution_contents(contents):
             and encode_json(get("environment/offline-negative.json")) == encode_json(_NEGATIVE_COMPLETE),
             "QUALIFICATION_ENVIRONMENT")
         primary, replay = get("environment/qualification.json"), get("environment/replay.json")
+        require(primary["preflight"]["approval"] == replay["preflight"]["approval"],
+                "QUALIFICATION_APPROVAL")
         captured_at = datetime.fromisoformat(session["started_utc"].replace("Z", "+00:00"))
         for group in (primary, replay):
             preflight = group["preflight"]
@@ -678,10 +684,10 @@ def validate_approval(approval, source, at=None):
     tools = approval["tools"]
     require(type(tools) is dict and tools.keys() == tools_fields
         and tools["python_archive_sha256"] == "17c4978a36c496dc53c08899ef8dad1ad2734f6325f08d6033a1e66419e0af26"
-        and tools["uv_version"] == "0.10.7" and tools["uv_identity_reviewed"] is True
-        and tools["uv_release"] == "https://github.com/astral-sh/uv/releases/tag/0.10.7"
+        and tools["uv_version"] == UV_VERSION and tools["uv_identity_reviewed"] is True
+        and tools["uv_release"] == UV_RELEASE and tools["uv_archive_sha256"] == UV_ARCHIVE_SHA256
         and type(tools["python_sys_version"]) is str and tools["python_sys_version"], "TOOL_IDENTITY_BLOCKED")
-    for key in ("python_executable_sha256", "uv_archive_sha256", "uv_executable_sha256"):
+    for key in ("python_executable_sha256", "uv_executable_sha256"):
         require(type(tools[key]) is str and re.fullmatch(r"[0-9a-f]{64}", tools[key]), "TOOL_IDENTITY_BLOCKED")
     require(type(approval["driver_version"]) is str
             and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", approval["driver_version"]), "APPROVAL_DRIVER")
@@ -1425,10 +1431,91 @@ def _profile_fixture():
         "remaining_free_seconds": 5400, "tools": {"python_archive_sha256":
             "17c4978a36c496dc53c08899ef8dad1ad2734f6325f08d6033a1e66419e0af26",
             "python_executable_sha256": "1" * 64, "python_sys_version": "synthetic Python",
-            "uv_archive_sha256": "2" * 64, "uv_executable_sha256": "3" * 64,
-            "uv_version": "0.10.7", "uv_identity_reviewed": True,
-            "uv_release": "https://github.com/astral-sh/uv/releases/tag/0.10.7"}}
+            "uv_archive_sha256": "5acfd9177cfecf0bf87578f059728215ccc884388988f55f7a65041b57387d91",
+            "uv_executable_sha256": "3" * 64,
+            "uv_version": "0.13.8", "uv_identity_reviewed": True,
+            "uv_release": "https://github.com/astral-sh/uv/releases/tag/0.13.8"}}
     return lock, report, hardware, approval
+
+
+class ToolApprovalTests(unittest.TestCase):
+    def test_exact_reviewed_uv_release_is_accepted(self):
+        approval = _profile_fixture()[3]
+        validate_approval(approval, approval["source_sha"])
+
+    def test_legacy_uv_approval_is_rejected(self):
+        approval = _profile_fixture()[3]
+        approval["tools"].update(uv_version="0.10.7",
+            uv_release="https://github.com/astral-sh/uv/releases/tag/0.10.7",
+            uv_archive_sha256="9ac6cee4e379a5abfca06e78a777b26b7ba1f81cb7935b97054d80d85ac00774")
+        with self.assertRaisesRegex(Blocked, "^TOOL_IDENTITY_BLOCKED$"):
+            validate_approval(approval, approval["source_sha"])
+
+    def test_wrong_tool_metadata_is_rejected(self):
+        cases = (
+            ("uv_version", "0.10.7"), ("uv_version", "0.13.9"),
+            ("uv_version", "0.13.8+local"),
+            ("uv_release", "https://github.com/astral-sh/uv/releases/tag/0.10.7"),
+            ("uv_release", "https://github.com/astral-sh/uv/releases/latest"),
+            ("uv_archive_sha256", "a" * 64), ("uv_archive_sha256", "invalid"),
+            ("uv_executable_sha256", "g" * 64), ("python_executable_sha256", "1234"),
+            ("uv_identity_reviewed", False), ("uv_identity_reviewed", 1),
+            ("python_archive_sha256", "3288c54cea3db350052019b3f8b558dd8a3da8afa6fda573f5fd2bcb37635b4a"),
+        )
+        for key, value in cases:
+            approval = _profile_fixture()[3]
+            approval["tools"][key] = value
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(Blocked, "^TOOL_IDENTITY_BLOCKED$"):
+                validate_approval(approval, approval["source_sha"])
+
+    def test_approval_and_tool_key_sets_are_closed(self):
+        approval = _profile_fixture()[3]
+        for key in approval:
+            reduced = {k: value for k, value in approval.items() if k != key}
+            with self.subTest(missing=key), self.assertRaisesRegex(Blocked, "^APPROVAL_INVALID$"):
+                validate_approval(reduced, approval["source_sha"])
+        for key in approval["tools"]:
+            reduced = dict(approval, tools={k: value for k, value in approval["tools"].items() if k != key})
+            with self.subTest(missing=key), self.assertRaisesRegex(Blocked, "^TOOL_IDENTITY_BLOCKED$"):
+                validate_approval(reduced, approval["source_sha"])
+        with self.assertRaisesRegex(Blocked, "^APPROVAL_INVALID$"):
+            validate_approval(dict(approval, human_approval=True), approval["source_sha"])
+        with self.assertRaisesRegex(Blocked, "^TOOL_IDENTITY_BLOCKED$"):
+            validate_approval(dict(approval, tools=dict(approval["tools"], extra=True)), approval["source_sha"])
+
+    def test_approval_is_source_bound_and_requires_current_security_review(self):
+        approval = _profile_fixture()[3]
+        with self.assertRaisesRegex(Blocked, "^APPROVAL_INVALID$"):
+            validate_approval(approval, "b" * 40)
+        for key in ("execution_authorized", "security_reviewed"):
+            with self.subTest(key=key), self.assertRaisesRegex(Blocked, "^APPROVAL_INVALID$"):
+                validate_approval(dict(approval, **{key: False}), approval["source_sha"])
+        with self.assertRaisesRegex(Blocked, "^APPROVAL_STALE$"):
+            validate_approval(dict(approval, reviewed_utc="2000-01-01T00:00:00Z"), approval["source_sha"])
+
+    def test_checked_controls_hash_the_resolved_uv_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            python, uv = base / "python-fixture", base / "uv-fixture"
+            python.write_bytes(b"synthetic interpreter bytes")
+            uv.write_bytes(b"synthetic installer bytes")
+            approval = _profile_fixture()[3]
+            approval["tools"].update(python_sys_version=sys.version,
+                python_executable_sha256=hashlib.sha256(python.read_bytes()).hexdigest(),
+                uv_executable_sha256=hashlib.sha256(uv.read_bytes()).hexdigest())
+            paths = {"root": base / "evidence", "cache": base / "cache", "uv": uv, "approval": base / "approval.json"}
+            raw = encode_json(approval)
+            paths["approval"].write_bytes(raw)
+            environment = {"VORTEX_GPU_APPROVAL_SHA256": hashlib.sha256(raw).hexdigest(),
+                "VORTEX_GPU_SOURCE_SHA": approval["source_sha"]}
+            with patch.dict(globals(), {"require_execution": lambda _: paths}), \
+                    patch.object(platform, "python_version", return_value="3.11.18"), \
+                    patch.object(platform, "machine", return_value="x86_64"), \
+                    patch.object(sys, "executable", str(python)):
+                self.assertEqual(checked_controls(environment), (paths, approval))
+                uv.write_bytes(b"changed synthetic bytes")
+                with self.assertRaisesRegex(Blocked, "^TOOL_CHECKSUM$"):
+                    checked_controls(environment)
 
 
 class NativeBoundaryTests(unittest.TestCase):
@@ -1617,6 +1704,20 @@ class CaptureSessionTests(unittest.TestCase):
 
 class ReviewRegressionTests(unittest.TestCase):
     api = ControllerTests.api
+
+    def test_replay_cannot_substitute_its_tool_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, _ = CaptureSessionTests().simulate(Path(directory))
+            bundle = Path(result["capture_directory"])
+            contents = {name: read_bytes(path) for name, path in bundle_files(bundle).items()}
+            validate_execution_contents(contents)
+            replay_path = "environment/replay.json"
+            replay = parse_json(contents[replay_path])
+            replay["preflight"]["approval"]["tools"]["uv_executable_sha256"] = "4" * 64
+            replay["preflight"]["uv_executable_sha256"] = "4" * 64
+            contents[replay_path] = encode_json(replay)
+            with self.assertRaisesRegex(Blocked, "^QUALIFICATION_INVALID$"):
+                validate_execution_contents(contents)
 
     def test_acquisition_and_load_share_the_same_absolute_budget(self):
         code = """import sys,json,time
