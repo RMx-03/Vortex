@@ -671,9 +671,15 @@ driver/security/resource verification and exact Python/uv executable identities.
 Linux bootstrap pins uv 0.13.8 and the exact Python 3.11.18 standalone build
 20261026. Archive provenance, measured executable hashes, and installed wheel
 receipts must be verified separately on the approved host. Primary and replay
-bind to the same source-specific execution approval. The separate worker
-hash-seed isolation correction remains a capture prerequisite. Linux CUDA and
-pretrained execution remain NOT VERIFIED.
+bind to the same source-specific execution approval. Linux CUDA and pretrained
+execution remain NOT VERIFIED.
+
+Before native work, supervised workers verify that Python honored
+`PYTHONHASHSEED=0`, with no user-site imports, safe import-path handling and
+unbuffered output. The parent filters the environment before interpreter startup.
+Lightweight subprocess fixtures verify reproducible Python string and bytes hashes.
+Library RNG seeding, strict PyTorch deterministic operations, CUDA/cuBLAS
+configuration and exact pretrained token replay require their own evidence.
 
 The controller first runs an offline missing-asset probe in a separate fresh
 process/cache. It initializes strict determinism before a tiny native GPU smoke,

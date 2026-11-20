@@ -46,6 +46,14 @@ UV_VERSION = "0.13.8"
 UV_RELEASE = f"https://github.com/astral-sh/uv/releases/tag/{UV_VERSION}"
 # Expected digest of the official Linux x86-64 GNU release archive.
 UV_ARCHIVE_SHA256 = "5acfd9177cfecf0bf87578f059728215ccc884388988f55f7a65041b57387d91"
+_EARLY_CONTROLS = {"CUDA_VISIBLE_DEVICES": "0", "PYTHONHASHSEED": "0",
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8", "PYTHONUNBUFFERED": "1"}
+_OPERATOR_ENVIRONMENT = {"PATH", "LANG", "LC_ALL", "VORTEX_GPU_EXECUTE", "VORTEX_GPU_PROFILE",
+    "VORTEX_GPU_SOURCE_SHA", "VORTEX_GPU_APPROVAL_SHA256", "VORTEX_GPU_APPROVAL", "VORTEX_GPU_PRIVATE_ROOT",
+    "VORTEX_GPU_CACHE", "VORTEX_GPU_UV"} | _EARLY_CONTROLS.keys()
+_WORKER_ENVIRONMENT = _OPERATOR_ENVIRONMENT | {"VORTEX_GPU_SESSION", "HOME", "HF_HOME", "HF_HUB_CACHE",
+    "HF_HUB_DISABLE_IMPLICIT_TOKEN", "HF_HUB_DISABLE_TELEMETRY", "HF_HUB_DISABLE_PROGRESS_BARS",
+    "DO_NOT_TRACK", "TOKENIZERS_PARALLELISM", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"}
 CAPTURES = ("A1", "A2", "A3", "B1", "B2", "B3", "C1", "C2", "C3", "A4", "B4", "C4")
 PAIRS = tuple(f"{prompt}1-{prompt}{repeat}" for prompt in "ABC" for repeat in (2, 3, 4))
 NATIVE_FAILURES = frozenset(("OUT_OF_MEMORY", "GENERATION_FAILED", "INVALID_OUTPUT", "LOAD_FAILED",
@@ -185,14 +193,15 @@ def source_identity(root, approved_sha):
     return {"source_sha": approved_sha, "dirty": False, "files": hashes}
 
 
+def require_early_controls(environment):
+    require(all(environment.get(key) == value for key, value in _EARLY_CONTROLS.items()), "BLOCKED_DETERMINISM")
+
+
 def require_execution(environment):
     require(environment.get("VORTEX_GPU_EXECUTE") == "1"
             and environment.get("VORTEX_GPU_PROFILE") == "t4-fp16"
             and platform.system() == "Linux", "BLOCKED_EXECUTION")
-    require(all(environment.get(key) == value for key, value in {
-        "CUDA_VISIBLE_DEVICES": "0", "PYTHONHASHSEED": "0",
-        "CUBLAS_WORKSPACE_CONFIG": ":4096:8", "PYTHONUNBUFFERED": "1"}.items()),
-        "BLOCKED_DETERMINISM")
+    require_early_controls(environment)
     require(re.fullmatch(r"[0-9a-f]{40}", environment.get("VORTEX_GPU_SOURCE_SHA", ""))
             and re.fullmatch(r"[0-9a-f]{64}", environment.get("VORTEX_GPU_APPROVAL_SHA256", "")),
             "BLOCKED_APPROVAL")
@@ -910,8 +919,21 @@ def worker_protocol(role, paths, approval, source, session, emit, state=None):
         state.clear()
 
 
+def require_worker_path(environment):
+    # Git and the driver probe use the operator's reviewed absolute search paths.
+    if "PATH" in environment:
+        require(all(Path(entry).is_absolute() for entry in environment["PATH"].split(os.pathsep)),
+                "BLOCKED_WORKER_ENVIRONMENT")
+
+
 def worker_entry(role, session):
     paths, approval = checked_controls(os.environ)
+    # CPython may add LC_CTYPE while coercing a legacy locale at startup.
+    require(os.environ.keys() <= _WORKER_ENVIRONMENT | {"LC_CTYPE"}, "BLOCKED_WORKER_ENVIRONMENT")
+    require_worker_path(os.environ)
+    require(sys.flags.hash_randomization == 0 and sys.flags.safe_path and sys.flags.no_user_site == 1
+            and sys.flags.dont_write_bytecode and sys.stdout.write_through
+            and isinstance(sys.stdout.buffer, io.FileIO), "BLOCKED_WORKER_STARTUP")
     def emit(event):
         sys.stdout.buffer.write(encode_json(event) + b"\n")
         sys.stdout.buffer.flush()
@@ -920,11 +942,17 @@ def worker_entry(role, session):
 
 
 def launch_worker(role, environment, callback, deadline):
+    require_early_controls(environment)
+    require(Path(sys.executable).is_absolute(), "TOOL_PYTHON")
+    # -I also ignores the seed. Keep its import-path protections and drop all
+    # unapproved environment variables before CPython initializes.
+    child_environment = {key: value for key, value in environment.items() if key in _WORKER_ENVIRONMENT}
+    require_worker_path(child_environment)
     stages = (("environment", 180), ("negative", 120)) if role == "negative" else (
         ("environment", 180), ("smoke", 120), ("assets", 1200), ("load", 1200),
         *((label, 120) for label in (CAPTURES[:9] if role == "primary" else CAPTURES[9:])))
-    return supervise([sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--_worker", role,
-        environment["VORTEX_GPU_SESSION"]], environment, stages, callback,
+    return supervise([sys.executable, "-P", "-s", "-B", "-u", str(Path(__file__).resolve()), "--_worker", role,
+        child_environment["VORTEX_GPU_SESSION"]], child_environment, stages, callback,
         2400 if role == "primary" else 1200, deadline)
 
 
@@ -1071,6 +1099,7 @@ def capture_session(root, source, environment, approval, *, session=None):
 
 def execute_gpu():
     paths, approval = checked_controls(os.environ)
+    require_worker_path(os.environ)
     source = os.environ["VORTEX_GPU_SOURCE_SHA"]
     source_identity(ROOT, source)
     paths["root"].mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1080,9 +1109,7 @@ def execute_gpu():
         require(directory.stat().st_uid == os.getuid() and stat.S_IMODE(directory.stat().st_mode) == 0o700,
                 "PRIVATE_PERMISSIONS")
     # Whitelist environment instead of inheriting account credentials/native hooks.
-    environment = {key: value for key, value in os.environ.items() if key in {"PATH", "LANG", "LC_ALL",
-        "CUDA_VISIBLE_DEVICES", "PYTHONHASHSEED", "CUBLAS_WORKSPACE_CONFIG", "PYTHONUNBUFFERED"}
-        or key.startswith("VORTEX_GPU_")}
+    environment = {key: value for key, value in os.environ.items() if key in _OPERATOR_ENVIRONMENT}
     environment.update(HOME=str(paths["root"] / "private-home"), HF_HOME=str(paths["cache"] / "home"),
         HF_HUB_CACHE=str(paths["cache"] / "hub"), HF_HUB_DISABLE_IMPLICIT_TOKEN="1", HF_HUB_DISABLE_TELEMETRY="1",
         HF_HUB_DISABLE_PROGRESS_BARS="1", DO_NOT_TRACK="1", TOKENIZERS_PARALLELISM="false")
@@ -1251,6 +1278,155 @@ class ControllerTests(unittest.TestCase):
                     "config_sha256": changed["config_sha256"], "numerical": changed["numerical"]})
             with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, code):
                 validate(records, attempts, "a" * 40, session)
+
+
+class WorkerStartupTests(unittest.TestCase):
+    environment = {"PYTHONHASHSEED": "0", "PYTHONUNBUFFERED": "1", "CUDA_VISIBLE_DEVICES": "0",
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8", "VORTEX_GPU_SESSION": "synthetic-session"}
+    probe = """import importlib.util, io, json, os, site, sys
+print(json.dumps({
+    'instance': os.urandom(16).hex(), 'hashes': [hash('vortex worker seed probe'), hash(b'worker bytes')],
+    'hash_randomization': sys.flags.hash_randomization, 'safe_path': sys.flags.safe_path,
+    'no_user_site': sys.flags.no_user_site, 'user_site_enabled': site.ENABLE_USER_SITE,
+    'write_through': sys.stdout.write_through, 'raw_stdout': isinstance(sys.stdout.buffer, io.FileIO),
+    'injected': [name for name in ('cwd_probe', 'script_probe', 'pythonpath_probe')
+                 if importlib.util.find_spec(name) is not None],
+    'controls': sorted(os.environ),
+    'visited_customization': getattr(sys.modules.get('sitecustomize'), 'vortex_fixture', False),
+}))
+"""
+
+    def launch_probe(self, directory, role, environment):
+        environment = {"HOME": str(directory / "private-home"), **environment}
+        script = directory / "entry" / "probe.py"
+        script.write_text(self.probe, encoding="utf-8")
+
+        def run_probe(command, child_env, stages, callback, seconds, deadline):
+            self.assertEqual(command[-4:], [str(Path(__file__).resolve()), "--_worker", role,
+                                           environment["VORTEX_GPU_SESSION"]])
+            result = subprocess.run([*command[:-4], str(script)], cwd=directory / "cwd", env=child_env,
+                stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=True)
+            self.assertEqual(result.stderr, b"")
+            return json.loads(result.stdout)
+
+        with patch.dict(globals(), {"supervise": run_probe}):
+            return launch_worker(role, environment, None, time.monotonic() + 10)
+
+    def test_effective_seed_and_isolation_in_independent_worker_processes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "entry").mkdir()
+            (directory / "cwd").mkdir()
+            runs = [self.launch_probe(directory, role, self.environment) for role in ("negative", "primary", "replay")]
+        self.assertEqual([run["hash_randomization"] for run in runs], [0, 0, 0])
+        self.assertEqual(runs[0]["hashes"], runs[1]["hashes"])
+        self.assertEqual(runs[1]["hashes"], runs[2]["hashes"])
+        self.assertEqual(len({run["instance"] for run in runs}), 3)
+        for run in runs:
+            self.assertTrue(run["safe_path"] and run["write_through"] and run["raw_stdout"])
+            self.assertEqual(run["no_user_site"], 1)
+            self.assertIs(run["user_site_enabled"], False)
+
+    def test_launcher_excludes_environment_import_paths_and_unknown_controls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for dirname, name in (("entry", "script_probe"), ("cwd", "cwd_probe"), ("injected", "pythonpath_probe")):
+                probe_path = directory / dirname
+                probe_path.mkdir()
+                (probe_path / (name + ".py")).write_text("fixture = True\n", encoding="utf-8")
+            (directory / "injected" / "sitecustomize.py").write_text("vortex_fixture = True\n", encoding="utf-8")
+            unwanted = {"PYTHONPATH": str(directory / "injected"), "PYTHONHOME": str(directory / "fake-home"),
+                "PYTHONUSERBASE": str(directory / "fake-user"), "PYTHONINSPECT": "1", "PYTHONOPTIMIZE": "1",
+                "PYTHONPLATLIBDIR": "invalid", "HF_TOKEN": "fixture-value", "HTTPS_PROXY": "fixture-value",
+                "VORTEX_GPU_UNKNOWN": "fixture-value"}
+            approved = dict(self.environment, HOME=str(directory / "private-home"), HF_HUB_OFFLINE="1",
+                TRANSFORMERS_OFFLINE="1")
+            run = self.launch_probe(directory, "replay", dict(approved, **unwanted))
+        self.assertEqual(run["injected"], [])
+        self.assertFalse(run["visited_customization"])
+        self.assertTrue(approved.keys() <= set(run["controls"]))
+        self.assertTrue(unwanted.keys().isdisjoint(run["controls"]))
+
+    def test_launcher_rejects_missing_or_unsupported_early_controls_before_start(self):
+        for key, value in (("PYTHONHASHSEED", None), ("PYTHONHASHSEED", "1"), ("PYTHONHASHSEED", "00"),
+                           ("PYTHONHASHSEED", "random"), ("PYTHONHASHSEED", "invalid"),
+                           ("PYTHONUNBUFFERED", "0"), ("CUDA_VISIBLE_DEVICES", "1"),
+                           ("CUBLAS_WORKSPACE_CONFIG", None)):
+            environment = dict(self.environment, **{key: value})
+            if value is None:
+                del environment[key]
+            with self.subTest(key=key, value=value), patch(f"{__name__}.supervise") as start:
+                with self.assertRaisesRegex(Blocked, "^BLOCKED_DETERMINISM$"):
+                    launch_worker("primary", environment, None, time.monotonic() + 10)
+                start.assert_not_called()
+
+    def test_launcher_rejects_implicit_current_directory_in_path(self):
+        trusted = str(Path(sys.executable).parent)
+        for path in ("", ".", f"{trusted}{os.pathsep}", f"{trusted}{os.pathsep}relative-bin"):
+            with self.subTest(path=path), patch(f"{__name__}.supervise") as start:
+                with self.assertRaisesRegex(Blocked, "^BLOCKED_WORKER_ENVIRONMENT$"):
+                    launch_worker("primary", dict(self.environment, PATH=path), None, time.monotonic() + 10)
+                start.assert_not_called()
+
+    def test_controller_checks_path_before_source_git(self):
+        with patch.dict(os.environ, {"PATH": ".", "VORTEX_GPU_SOURCE_SHA": "a" * 40}), \
+                patch(f"{__name__}.checked_controls", return_value=({}, {})), \
+                patch(f"{__name__}.source_identity", side_effect=AssertionError("source Git started")) as check_source:
+            with self.assertRaisesRegex(Blocked, "^BLOCKED_WORKER_ENVIRONMENT$"):
+                execute_gpu()
+            check_source.assert_not_called()
+
+    def test_worker_checks_interpreter_state_before_dispatch(self):
+        code = """import os, runpy, sys
+entry = runpy.run_path(sys.argv[1])['worker_entry']
+os.environ.pop('PYTHONUSERBASE')  # The fixture's empty user site was used only at startup.
+if os.name == 'nt':
+    os.environ.pop('SYSTEMROOT', None)  # Needed only to initialize the Windows test interpreter.
+entry.__globals__.update(checked_controls=lambda env: ({}, {}),
+                         worker_protocol=lambda *args: print('dispatched'))
+try:
+    entry('primary', 'synthetic-session')
+except ValueError as error:
+    print(str(error))
+"""
+        script = str(Path(__file__).resolve())
+        environment = dict(self.environment, VORTEX_GPU_SOURCE_SHA="a" * 40)
+        if os.name == "nt":
+            environment["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+        flags = ["-P", "-s", "-B", "-u"]
+        blocked = b"BLOCKED_WORKER_STARTUP"
+        cases = ((flags, {}, b"dispatched"), (["-I", "-B", "-u"], {}, blocked),
+                 (flags[1:], {}, blocked), (["-P", "-B", "-u"], {}, blocked),
+                 (flags[:-1], {"PYTHONUNBUFFERED": ""}, blocked),
+                 (flags, {"PYTHONPATH": ""}, b"BLOCKED_WORKER_ENVIRONMENT"))
+        with tempfile.TemporaryDirectory() as directory:
+            environment.update(HOME=directory, PYTHONUSERBASE=directory)
+            for options, override, expected in cases:
+                with self.subTest(options=options, override=override):
+                    result = subprocess.run([sys.executable, *options, "-c", code, script],
+                        cwd=directory, env=dict(environment, **override), stdin=subprocess.DEVNULL,
+                        capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, b"")
+                    self.assertEqual(result.stdout.strip(), expected)
+
+    def test_worker_launch_still_supervises_timeout_and_native_failure(self):
+        native_failure = """import json, sys
+print(json.dumps({'event': 'start', 'stage': 'environment'}))
+assert sys.stdin.readline() == 'GO\\n'
+print(json.dumps({'event': 'failed', 'stage': 'environment', 'data': {'code': 'OUT_OF_MEMORY'}}))
+sys.stdin.readline()
+"""
+        supervise_process = supervise
+        for code, outcome, seconds in (("import time; time.sleep(10)", "TIMEOUT", .5),
+                                       (native_failure, "OUT_OF_MEMORY", 5)):
+            def supervise_probe(command, environment, stages, callback, process_seconds, deadline):
+                return supervise_process([*command[:-4], "-c", code], environment, stages, callback,
+                                         process_seconds, deadline)
+
+            with self.subTest(outcome=outcome), patch.dict(globals(), {"supervise": supervise_probe}):
+                with self.assertRaisesRegex(Blocked, f"^{outcome}$"):
+                    launch_worker("negative", self.environment, lambda *_: None, time.monotonic() + seconds)
 
 
 class SupervisionTests(unittest.TestCase):

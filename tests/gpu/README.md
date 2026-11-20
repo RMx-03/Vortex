@@ -90,9 +90,7 @@ Both executable hashes must come from the separate identity review. Symlinked
 venv interpreters are checked against their resolved regular executable. Use
 one approval for primary and replay, bound to the new reviewed source SHA and
 the actual free session. A missing or incompatible gate fails BLOCKED.
-The separate worker hash-seed isolation correction is also required before
-real capture. For historical evidence, use the original reviewed source SHA
-for read-only reopen.
+For historical evidence, use the original reviewed source SHA for read-only reopen.
 
 After all prerequisites and controls are approved, use the exact environment's
 Python executable with the discovery command above. It runs one real capture
@@ -101,6 +99,22 @@ A successful capture test still leaves export/readback, independent evidence
 review and human golden approval pending.
 
 ## Execution and supervision
+
+The controller starts each worker with the approved absolute interpreter and
+`-P -s -B -u`. `-P` keeps the current and script directories off the implicit
+import path. `-s` disables the user site. The harness adds its known source paths
+explicitly. The parent passes only named runtime controls and generated cache and
+offline settings. It excludes `PYTHONPATH`, `PYTHONHOME`, `PYTHONUSERBASE` and
+other unapproved variables before Python starts. Use an approved host `PATH`
+with absolute entries for Git and the driver probe. Start capture through the
+controller so its pre-start environment filter applies to every worker.
+
+The worker checks that hash randomization is disabled, safe path and no-user-site
+are active, and stdout is unbuffered before native work. Standalone CPU probes
+verify repeatable string and bytes hashes across independent processes.
+Python hash-seed evidence covers only interpreter hashing. Library RNG seeds,
+Torch deterministic operations and cuBLAS settings have separate controls.
+Exact pretrained token replay remains NOT VERIFIED until real qualification.
 
 A fresh offline-negative interpreter proves missing assets fail in a separate
 empty cache without network or model construction. The primary interpreter then
